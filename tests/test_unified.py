@@ -564,3 +564,60 @@ def test_greetings_go_to_the_ai_for_a_natural_reply(u):
     with_brain(u, ChatDecision(reply="Yo! Not much, just here to build stuff. Got an idea?"))
     u.text(OWNER, "yo hi")
     assert u.last() in ("Yo! Not much, just here to build stuff. Got an idea?", "Genesis: Yo! Not much, just here to build stuff. Got an idea?") and u.jobs() == []
+
+
+# ---------- Weave hosting (<name>.<sites_domain>) ----------
+@pytest.fixture
+def hosted(settings, tmp_path):
+    settings.website_deploy = "weave"
+    settings.sites_domain = "weave.xyz"
+    return UEnv(settings, tmp_path, results=[ok(), ok(html=PAGE.replace("Brew Haven", "Brew Haven v2")), ok()])
+
+
+def test_every_website_goes_live_on_its_own_subdomain(hosted):
+    hosted.text(OWNER, "Create a premium website for my coffee brand")
+    hosted.drain()
+    done = hosted.last()
+    assert "https://brew-haven.weave.xyz/" in done and "live" in done
+    assert hosted.projects()[0]["deploy_url"] == "https://brew-haven.weave.xyz/"
+    assert hosted.publisher.calls == []  # never Netlify
+    r = hosted.client.get("/", headers={"host": "brew-haven.weave.xyz"})
+    assert r.status_code == 200 and "Brew Haven" in r.text
+    assert r.headers["content-security-policy"].startswith("sandbox allow-scripts")
+    assert hosted.client.get("/index.html", headers={"host": "brew-haven.weave.xyz"}).status_code == 200
+
+
+def test_a_change_updates_the_same_subdomain(hosted):
+    hosted.text(OWNER, "Create a premium website for my coffee brand")
+    hosted.drain()
+    hosted.text(OWNER, "make the header darker")
+    hosted.drain()
+    assert hosted.projects()[0]["deploy_url"] == "https://brew-haven.weave.xyz/"
+    r = hosted.client.get("/", headers={"host": "brew-haven.weave.xyz"})
+    assert "Brew Haven v2" in r.text
+
+
+def test_hosted_sites_never_reach_the_api_or_other_files(hosted):
+    hosted.text(OWNER, "Create a premium website for my coffee brand")
+    hosted.drain()
+    h = {"host": "brew-haven.weave.xyz"}
+    for path in ("/api/builds", "/api/health", "/../sms.db", "/chat", "/job.json"):
+        assert hosted.client.get(path, headers=h).status_code == 404, path
+    assert hosted.client.post("/api/builds", headers=h, json={}).status_code == 405
+    assert hosted.client.get("/", headers={"host": "nope.weave.xyz"}).status_code == 404
+    assert hosted.client.get("/", headers={"host": "www.weave.xyz"}).status_code != 200
+    assert hosted.client.get("/", headers={"host": "a.b.weave.xyz"}).status_code != 200
+
+
+def test_same_brand_names_get_different_subdomains(tmp_path):
+    from genesis.web.hosting import publish_hosted, site_label
+
+    site = tmp_path / "s"
+    site.mkdir()
+    (site / "index.html").write_text("<html><body>x</body></html>")
+    root = tmp_path / "hosted"
+    first = site_label(root, "Brew Haven")
+    publish_hosted(root, site, first)
+    second = site_label(root, "Brew Haven")
+    assert first == "brew-haven" and second.startswith("brew-haven-") and second != first
+    assert site_label(root, "WWW") != "www" and site_label(root, "!!") .startswith("site")

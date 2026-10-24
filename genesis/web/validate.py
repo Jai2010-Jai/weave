@@ -9,8 +9,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 MAX_PAGE_BYTES = 1_000_000
-MAX_PAGES = 3
-PAGE_NAME_RE = re.compile(r"^(?:index|option[23])\.html$")
+MAX_PAGES = 8  # index, up to 2 design options, up to 4 extra pages
+# index.html, design options (option2/3.html) and extra pages such as about.html or contact-us.html.
+PAGE_NAME_RE = re.compile(r"^(?:index|option[23]|[a-z][a-z0-9-]{1,19})\.html$")
 # Script origins the preview CSP allows. weave's generator uses the Tailwind CDN; the others are common CDNs.
 SCRIPT_HOSTS = ("cdn.tailwindcss.com", "cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com")
 

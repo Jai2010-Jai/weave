@@ -530,6 +530,8 @@ class SmsService:
 
     # ---------- publishing (websites only, owner approval every time) ----------
     def publish_problem(self) -> str:
+        if self.s.website_deploy == "weave":
+            return "" if self.s.sites_domain else "Weave hosting has no domain (GENESIS_SITES_DOMAIN)"
         if self.s.website_deploy != "netlify":
             return "publishing is switched off on this Weave server"
         if not self.s.netlify_auth_token:

@@ -25,6 +25,8 @@ from .config import Settings, settings as default_settings
 from .core.antigravity import make_ai_client
 from .core.jobs import JOB_ID_RE, Orchestrator, QueueFullError, public_job
 from .core.schemas import BuildRequest
+from .sms.routes import PREVIEW_CSP
+from .web.hosting import hosted_file, label_for_host
 
 log = logging.getLogger("genesis.server")
 STATIC = Path(__file__).parent / "static"
@@ -126,6 +128,18 @@ def create_app(settings: Settings | None = None, orchestrator: Orchestrator | No
         bearer = request.headers.get("authorization", "")
         presented = bearer[7:] if bearer.lower().startswith("bearer ") else ""
         authed = False
+        hosted = label_for_host(host, s.sites_domain) if s.website_deploy == "weave" else None
+        if hosted:
+            # A customer site on <name>.<sites_domain>: public, read-only, sandboxed. Never reaches the API.
+            if request.method not in ("GET", "HEAD"):
+                return PlainTextResponse("Method not allowed", status_code=405)
+            f = hosted_file(s.hosted_dir, hosted, request.url.path)
+            if f is None:
+                return PlainTextResponse("This site doesn't exist (yet). Made with Weave.", status_code=404)
+            return FileResponse(f, media_type="text/html; charset=utf-8", headers={
+                "Content-Security-Policy": PREVIEW_CSP, "Cache-Control": "public, max-age=60",
+                "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+                "Cross-Origin-Opener-Policy": "same-origin"})
         if request.method == "GET" and request.url.path == "/get":
             # The phone client APK holds no secrets; anyone on the network may download it.
             return await call_next(request)

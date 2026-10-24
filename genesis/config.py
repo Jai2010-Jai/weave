@@ -219,9 +219,16 @@ class Settings:
     node_bin: str = field(default_factory=lambda: _str_env("GENESIS_NODE_BIN") or shutil.which("node") or "")
     # Design options generated per new website (each is one more large Gemini call).
     website_variants: int = field(default_factory=lambda: _int_env("GENESIS_WEBSITE_VARIANTS", 1, 1, 3))
+    # Tried in order when the main model is overloaded (Gemini 503/429); each model family has its own capacity.
+    website_fallback_models: str = field(default_factory=lambda: _str_env("GENESIS_WEBSITE_FALLBACK_MODELS") or
+                                         "gemini-3.8-flash,gemini-2.5-flash,gemini-flash-latest,gemini-3.5-flash-lite")
+    # Extra pages (about, contact, ...) added to each new website; 0 = one-page sites. Each is one more Gemini call.
+    website_pages: int = field(default_factory=lambda: _int_env("GENESIS_WEBSITE_PAGES", 3, 0, 4))
     website_timeout: int = field(default_factory=lambda: _int_env("GENESIS_WEBSITE_TIMEOUT_SECONDS", 1200, 60, 3600))
-    # Publishing is off unless set to netlify AND a token is configured; every publish still needs the owner's PUBLISH.
-    website_deploy: str = field(default_factory=lambda: _choice_env("GENESIS_WEBSITE_DEPLOY", "off", {"off", "netlify"}))
+    # Publishing: off | netlify (owner approves each PUBLISH; needs a token) |
+    # weave (every finished website goes live at https://<name>.<GENESIS_SITES_DOMAIN>/, served by this server).
+    website_deploy: str = field(default_factory=lambda: _choice_env("GENESIS_WEBSITE_DEPLOY", "off", {"off", "netlify", "weave"}))
+    sites_domain: str = field(default_factory=lambda: _str_env("GENESIS_SITES_DOMAIN").lower().strip("."))
     netlify_auth_token: str = field(default_factory=lambda: _str_env("NETLIFY_AUTH_TOKEN"), repr=False)
 
     @property
@@ -231,6 +238,10 @@ class Settings:
     @property
     def sites_dir(self) -> Path:
         return self.data_dir / "sites"
+
+    @property
+    def hosted_dir(self) -> Path:
+        return self.data_dir / "hosted"
 
     @property
     def gradle_user_home(self) -> Path:
@@ -399,6 +410,12 @@ class Settings:
         checks = [{"name": "Website builder", "ok": not problem,
                    "detail": problem or f"weave engine at {Path(self.website_engine_dir).expanduser()}",
                    "fix": "" if not problem else "See README: Website builder"}]
+        if self.website_deploy == "weave":
+            checks.append({"name": "Website publishing", "ok": bool(self.sites_domain),
+                           "detail": f"Weave hosting: every website goes live at https://<name>.{self.sites_domain}/"
+                                     if self.sites_domain else "GENESIS_SITES_DOMAIN is not set",
+                           "fix": "" if self.sites_domain else "Set GENESIS_SITES_DOMAIN (e.g. weave.xyz) and point *.domain at this server"})
+            return checks
         publish = self.website_deploy == "netlify" and bool(self.netlify_auth_token)
         checks.append({"name": "Website publishing", "ok": True,
                        "detail": "Netlify (owner approval per publish)" if publish else

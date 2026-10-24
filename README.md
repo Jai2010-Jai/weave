@@ -132,6 +132,32 @@ This starts:
 
 ---
 
+## Hosting Websites on Your Domain (`<name>.weave.xyz`)
+
+With `GENESIS_WEBSITE_DEPLOY=weave`, every finished website goes live on its own subdomain, served by this
+Weave server. A change updates the same address.
+
+```dotenv
+GENESIS_WEBSITE_DEPLOY=weave
+GENESIS_SITES_DOMAIN=weave.xyz
+GENESIS_WEBSITE_PAGES=3   # extra pages (about, contact, ...) per new site, 0-4
+```
+
+Then send `*.weave.xyz` to this server. With a Cloudflare **named** tunnel (quick tunnels can't do wildcards):
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create weave
+cloudflared tunnel route dns weave '*.weave.xyz'
+cloudflared tunnel route dns weave app.weave.xyz
+cloudflared tunnel run --url http://127.0.0.1:8765 weave
+```
+
+Set `PUBLIC_BASE_URL=https://app.weave.xyz` so chat and WhatsApp links use the same tunnel. Names like
+`www`, `app`, `api` and `chat` are reserved and never given to a customer site. Hosted sites are static,
+read-only, served inside the same CSP sandbox as previews, and can't reach Weave's API. Files live in
+`data/hosted/<name>/`.
+
 ## Configuring Meta WhatsApp Cloud API
 
 To connect Weave to WhatsApp:

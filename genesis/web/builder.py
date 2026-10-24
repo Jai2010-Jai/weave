@@ -69,7 +69,7 @@ def _limit_resources() -> None:  # runs in the child before exec
 def node_runner(settings: Settings) -> Runner:
     def run(request: dict, env: dict, cwd: Path, timeout: int, cancel: threading.Event, log_path: Path) -> dict:
         is_win = sys.platform == "win32"
-        popen_kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if is_win else {"start_new_session": True, "preexec_fn": _limit_resources}
+        popen_kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)} if is_win else {"start_new_session": True, "preexec_fn": _limit_resources}
         with open(log_path, "a", encoding="utf-8") as logf:
             proc = subprocess.Popen([settings.node_bin, str(BRIDGE)], cwd=cwd, env=env, stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=logf, **popen_kwargs)
@@ -192,7 +192,8 @@ class WebsiteBuilder:
         node_dir = str(Path(self.s.node_bin).parent)
         return {"PATH": f"{node_dir}:/usr/bin:/bin", "HOME": str(sandbox), "TMPDIR": str(sandbox),
                 "WEAVE_DATA_DIR": str(sandbox / "weave"), "AGY_BIN": "/nonexistent/agy",
-                "GEMINI_API_KEY": self.s.gemini_api_key, "GEMINI_MODEL": self._model(), "NODE_OPTIONS": ""}
+                "GEMINI_API_KEY": self.s.gemini_api_key, "GEMINI_MODEL": self._model(),
+                "GEMINI_FALLBACK_MODELS": self.s.website_fallback_models, "NODE_OPTIONS": ""}
 
     def _model(self) -> str:
         if self.s.gemini_model and self.s.gemini_model != "auto":
@@ -222,7 +223,8 @@ class WebsiteBuilder:
             job["app_name"] = base.get("app_name")
             self._stage(job, "generating", "Gemini is applying your change to the website")
         else:
-            request.update(op="generate", prompt=job["prompt"], variants=self.s.website_variants)
+            request.update(op="generate", prompt=job["prompt"], variants=self.s.website_variants,
+                           extra_pages=self.s.website_pages)
             self._stage(job, "generating", "Researching a design direction and writing the website")
         self._log(job, f"== Website engine: {request['op']} (model {self._model()}) ==")
         started = time.monotonic()

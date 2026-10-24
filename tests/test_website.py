@@ -3,6 +3,7 @@ The bridge test runs the real bridge.mjs under Node against a fake weave engine 
 use a fake runner. No test calls Gemini or Netlify."""
 
 import json
+import os
 import shutil
 import threading
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 from genesis.core.schemas import BuildRequest
 from genesis.web import deploy
 from genesis.web.builder import BRIDGE, WebsiteBuilder, node_runner
-from genesis.web.validate import WebsiteValidationError, validate_page
+from genesis.web.validate import WebsiteValidationError, validate_page, validate_site
 
 PAGE = ("<!DOCTYPE html><html><head><script src=\"https://cdn.tailwindcss.com\"></script></head>"
         "<body><h1>Brew Haven</h1></body></html>")
@@ -90,7 +91,8 @@ def test_bridge_env_holds_only_the_gemini_key(web_settings):
     joined = json.dumps(env)
     for secret in ("nfp_secret_token", web_settings.twilio_auth_token):
         assert secret not in joined
-    assert set(env) == {"PATH", "HOME", "TMPDIR", "WEAVE_DATA_DIR", "AGY_BIN", "GEMINI_API_KEY", "GEMINI_MODEL", "NODE_OPTIONS"}
+    assert set(env) == {"PATH", "HOME", "TMPDIR", "WEAVE_DATA_DIR", "AGY_BIN", "GEMINI_API_KEY", "GEMINI_MODEL",
+                        "GEMINI_FALLBACK_MODELS", "NODE_OPTIONS"}
 
 
 def test_engine_failure_fails_the_build(web_settings):
@@ -183,12 +185,16 @@ export class GeminiClient {
   constructor() { this.apiKey = process.env.GEMINI_API_KEY || ''; this.model = process.env.GEMINI_MODEL; }
   async generateContent(prompt, system, config) {
     const mode = process.env.FAKE_MODE;
+    if (mode === 'busy' && this.model === 'fake-model') throw new Error('Gemini API error (503): high demand');
     if (mode === 'down') throw new Error('Gemini API error (503): overloaded key=AIzaSyFAKEFAKEFAKEFAKEFAKEFAKE');
     if (system.includes('Design Director') && mode === 'badjson') return { text: '{"topicAnalysis": {"brandName": "X",}', raw: {} };
     if (system.includes('Design Director') && !(config?.responseMimeType === 'application/json'
         && config?.responseJsonSchema?.properties?.inspirations?.minItems === 3)) return { text: 'not json', raw: {} };
     if (system.includes('Design Director')) return { text: JSON.stringify({ topicAnalysis: { brandName: 'Brew Haven' },
       inspirations: [{ name: 'Roast', sourceInspiration: 'Cafe' }, { name: 'B' }, { name: 'C' }] }), raw: {} };
+    if (system.includes('page structure')) return { text: JSON.stringify({ pages: [{ slug: 'About', title: 'About', purpose: 'story' },
+      { slug: 'index', title: 'Home', purpose: 'dup' }, { slug: '../evil', title: 'Evil', purpose: 'x' }, { slug: 'contact', title: 'Contact', purpose: 'reach us' }] }), raw: {} };
+    if (system.includes('matching page')) return { text: '```html\\n<!DOCTYPE html><html><body><nav><a href="index.html">Home</a><a href="about.html">About</a><a href="contact.html">Contact</a></nav>page</body></html>\\n```', raw: {} };
     if (mode === 'nohtml') return { text: 'Sorry, I cannot.', raw: {} };
     if (system.includes('critique')) return { text: mode === 'same' ? CURRENT : '<!DOCTYPE html><html><body>changed</body></html>', raw: {} };
     return { text: '```html\\n<!DOCTYPE html><html><body>model page</body></html>\\n```', raw: { usageMetadata: { promptTokenCount: 5 } } };
@@ -251,7 +257,7 @@ def run_bridge(settings, tmp_path, request, mode="ok", key="AIzaSyFAKEFAKEFAKEFA
     sandbox.mkdir(exist_ok=True)
     env = {"PATH": f"{Path(settings.node_bin).parent}:/usr/bin:/bin", "HOME": str(sandbox), "GEMINI_API_KEY": key,
            "GEMINI_MODEL": "fake-model", "FAKE_MODE": mode, "WEAVE_DATA_DIR": str(sandbox),
-           "GENESIS_RESEARCH_RETRY_MS": "0"}
+           "GENESIS_RESEARCH_RETRY_MS": "0", "GEMINI_FALLBACK_MODELS": os.environ.get("GEMINI_FALLBACK_MODELS", "")}
     log = tmp_path / "bridge.log"
     result = node_runner(settings)({**request, "out_dir": str(out)}, env, sandbox, 60, threading.Event(), log)
     return result, out
@@ -265,6 +271,45 @@ def test_bridge_generates_page_from_model(settings, tmp_path, fake_engine):
     assert (out / "index.html").read_text() == "<!DOCTYPE html><html><body>model page</body></html>"
     assert [c["phase"] for c in result["calls"]] == ["research", "html-1"]
     assert result["calls"][1]["input_tokens"] == 5
+
+
+@needs_node
+def test_bridge_adds_extra_pages_and_links_them_from_home(settings, tmp_path, fake_engine):
+    result, out = run_bridge(settings, tmp_path, {"op": "generate", "engine_dir": str(fake_engine), "prompt": "coffee",
+                                                  "extra_pages": 3})
+    assert result["ok"] is True, result
+    # "index" is refused (reserved) and "../evil" can only ever become a plain file inside the site.
+    assert sorted(p.name for p in out.iterdir()) == ["about.html", "contact.html", "evil.html", "index.html"]
+    assert [p["file"] for p in result["pages"]] == ["index.html", "about.html", "evil.html", "contact.html"]
+    assert not (out.parent / "evil.html").exists()
+    assert 'href="contact.html"' in (out / "index.html").read_text()  # nav added to the home page
+    assert validate_site(out)  # extra page names pass validation
+
+
+@needs_node
+def test_bridge_change_keeps_extra_pages(settings, tmp_path, fake_engine):
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "index.html").write_text("<!DOCTYPE html><html><body>old</body></html>")
+    (base / "about.html").write_text("<!DOCTYPE html><html><body>about</body></html>")
+    req = {"op": "modify", "engine_dir": str(fake_engine), "base_dir": str(base), "feedback": "make it dark"}
+    result, out = run_bridge(settings, tmp_path, req)
+    assert result["ok"] is True and (out / "about.html").read_text().endswith("about</body></html>")
+
+
+@needs_node
+def test_bridge_switches_model_when_gemini_is_overloaded(settings, tmp_path, fake_engine):
+    import os
+    os.environ["GEMINI_FALLBACK_MODELS"] = "backup-model"
+    try:
+        result, out = run_bridge(settings, tmp_path, {"op": "generate", "engine_dir": str(fake_engine), "prompt": "coffee"},
+                                 mode="busy")
+    finally:
+        del os.environ["GEMINI_FALLBACK_MODELS"]
+    assert result["ok"] is True, result
+    assert (out / "index.html").exists()
+    assert [(c["model"], c["ok"]) for c in result["calls"] if c["phase"] == "research"] == [
+        ("fake-model", False), ("fake-model", False), ("backup-model", True)]
 
 
 @needs_node

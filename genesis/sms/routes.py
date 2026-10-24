@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Res
 
 from ..config import Settings
 from ..core.jobs import JobStore
+from ..web.validate import PAGE_NAME_RE
 from .meta import parse_webhook_payload, validate_signature, verify_challenge
 from .observe import counters, event
 from .phone import mask, normalize_e164
@@ -26,7 +27,7 @@ EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
 MAX_DOWNLOADS_PER_LINK = 25
 MAX_PREVIEW_VIEWS_PER_LINK = 200
-PREVIEW_PAGE_RE = re.compile(r"^(?:index|option[23])\.html$")
+PREVIEW_PAGE_RE = PAGE_NAME_RE
 # Generated websites are untrusted. `sandbox` without allow-same-origin gives the page an opaque origin, so its
 # scripts can't read Genesis cookies or call Genesis APIs; the rest limits what it can load or send.
 PREVIEW_CSP = ("sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; default-src 'none'; "

@@ -124,6 +124,8 @@ const RESEARCH_SCHEMA = {
 };
 
 const calls = [];
+const busyModels = new Set();
+const TRANSIENT = /\((?:429|500|502|503|504)\)|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|fetch failed|ECONNRESET|ETIMEDOUT|socket hang up/i;
 let phase = 'setup';
 const aiText = {}; // phase -> last raw model text
 
@@ -147,25 +149,47 @@ async function loadEngine(engineDir) {
       calls.push({ phase, ok: false, error: err.message });
       throw err;
     }
-    const started = Date.now();
     if (phase === 'research' && !config) {
       // weave parses this reply as JSON but doesn't ask for JSON; without JSON mode Gemini sometimes returns
       // invalid JSON and weave silently switches to canned directions.
       config = { responseMimeType: 'application/json', responseJsonSchema: RESEARCH_SCHEMA };
     }
+    // Gemini regularly answers 503 "high demand" (also 429/500). Each model gets a retry, then the next model in
+    // GEMINI_FALLBACK_MODELS takes over: different model families have separate capacity.
+    const primary = geminiClient.model;
+    const all = [...new Set([primary, ...String(process.env.GEMINI_FALLBACK_MODELS || '').split(',').map((m) => m.trim()).filter(Boolean)])];
+    // Models that were overloaded earlier in this build go last, so later pages don't wait on them again.
+    const models = [...all.filter((m) => !busyModels.has(m)), ...all.filter((m) => busyModels.has(m))];
+    const pause = Number(process.env.GENESIS_RESEARCH_RETRY_MS ?? 5000);
+    let lastError;
     try {
-      const res = await original(prompt, system, config);
-      const usage = res?.raw?.usageMetadata || {};
-      calls.push({ phase, ok: true, model: geminiClient.model, ms: Date.now() - started,
-        input_tokens: usage.promptTokenCount ?? null, output_tokens: usage.candidatesTokenCount ?? null });
-      aiText[phase] = res?.text || '';
-      return res;
-    } catch (e) {
-      calls.push({ phase, ok: false, model: geminiClient.model, ms: Date.now() - started, error: sanitize(e.message) });
-      throw e;
+      for (const model of models) {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          geminiClient.model = model;
+          const started = Date.now();
+          try {
+            const res = await original(prompt, system, config);
+            const usage = res?.raw?.usageMetadata || {};
+            calls.push({ phase, ok: true, model, ms: Date.now() - started,
+              input_tokens: usage.promptTokenCount ?? null, output_tokens: usage.candidatesTokenCount ?? null });
+            aiText[phase] = res?.text || '';
+            return res;
+          } catch (e) {
+            calls.push({ phase, ok: false, model, ms: Date.now() - started, error: sanitize(e.message) });
+            lastError = e;
+            if (!TRANSIENT.test(String(e?.message))) throw e;
+            if (attempt === 2) busyModels.add(model);
+            log(`Gemini busy on ${model} (${phase}); ${attempt < 2 ? 'retrying' : 'trying the next model'}`);
+            if (attempt < 2) await new Promise((r) => setTimeout(r, pause * attempt));
+          }
+        }
+      }
+      throw lastError;
+    } finally {
+      geminiClient.model = primary;
     }
   };
-  return { research, bespoke };
+  return { research, bespoke, gemini: geminiClient };
 }
 
 function lastCall(p) {
@@ -221,6 +245,15 @@ async function generate(req, engine) {
     pages.push({ file, option: i + 1, name: String(inspirations[i]?.name || '').slice(0, 120),
       inspiration: String(inspirations[i]?.sourceInspiration || '').slice(0, 200) });
   }
+  const extra = Math.max(0, Math.min(MAX_EXTRA_PAGES, Number(req.extra_pages) || 0));
+  if (extra > 0) {
+    // Extra pages are optional: a failure here still leaves a working one-page site.
+    try {
+      pages.push(...await addPages(req, engine, topic, out, extra));
+    } catch (e) {
+      log(`extra pages skipped: ${sanitize(e?.message || e)}`);
+    }
+  }
   return {
     ok: true,
     brand_name: String(topic.brandName || '').slice(0, 60),
@@ -229,6 +262,98 @@ async function generate(req, engine) {
     brand_from_research: researchFromModel,
     pages,
   };
+}
+
+// ---------- multi-page sites (Genesis addition; weave itself writes one page) ----------
+const MAX_EXTRA_PAGES = 4;
+const RESERVED_PAGES = new Set(['index', 'option2', 'option3']);
+const PLAN_SCHEMA = {
+  type: 'object',
+  properties: { pages: { type: 'array', maxItems: MAX_EXTRA_PAGES, items: { type: 'object',
+    properties: { slug: STR, title: STR, purpose: STR }, required: ['slug', 'title', 'purpose'] } } },
+  required: ['pages'],
+};
+
+function stripFences(text) {
+  const t = String(text || '').trim();
+  const m = t.match(/```(?:html)?\s*([\s\S]*?)```/i);
+  return (m ? m[1] : t).trim();
+}
+
+function pageSlug(raw) {
+  const slug = String(raw || '').toLowerCase().replace(/\.html?$/, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20);
+  return /^[a-z][a-z0-9-]{1,19}$/.test(slug) && !RESERVED_PAGES.has(slug) ? slug.replace(/-+$/, '') : '';
+}
+
+const firstNav = (html) => (html.match(/<nav\b[\s\S]*?<\/nav>/i) || [null])[0];
+
+// Gemini often answers 503/429 under load; extra pages retry a few times before giving up.
+async function withRetry(fn) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (attempt >= 3 || !/\((?:429|500|503)\)|fetch failed|ECONNRESET/i.test(String(e?.message))) throw e;
+      await new Promise((r) => setTimeout(r, Number(process.env.GENESIS_RESEARCH_RETRY_MS ?? 5000) * attempt));
+    }
+  }
+}
+
+async function addPages(req, engine, topic, out, extra) {
+  const index = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
+  phase = 'pages-plan';
+  const plan = await withRetry(() => engine.gemini.generateContent(
+    `Website request: ${req.prompt}\nBrand: ${topic.brandName || ''}\n\nThe home page (index.html) already exists. ` +
+    `Choose up to ${extra} more pages this website should have (for example about, menu, services, pricing, contact). ` +
+    'Use short lowercase slugs. Do not include the home page.',
+    'You plan the page structure of small business and portfolio websites. Reply with JSON only.',
+    { responseMimeType: 'application/json', responseJsonSchema: PLAN_SCHEMA }));
+  const seen = new Set();
+  const wanted = [];
+  for (const p of (JSON.parse(plan.text || '{}').pages || [])) {
+    const slug = pageSlug(p.slug);
+    if (slug && !seen.has(slug) && wanted.length < extra) {
+      seen.add(slug);
+      wanted.push({ file: `${slug}.html`, title: String(p.title || slug).slice(0, 60), purpose: String(p.purpose || '').slice(0, 300) });
+    }
+  }
+  if (!wanted.length) return [];
+  const navList = [{ file: 'index.html', title: 'Home' }, ...wanted].map((p) => `${p.title} -> ${p.file}`).join('\n');
+  const reference = index.slice(0, 14000);
+  const done = [];
+  for (const p of wanted) {
+    phase = `page-${p.file}`;
+    let res;
+    try {
+      res = await withRetry(() => engine.gemini.generateContent(
+      `Write the "${p.title}" page (${p.file}) of this website. Purpose: ${p.purpose}\n` +
+      `Original request: ${req.prompt}\n\nThe site's pages (link to them with these exact relative file names):\n${navList}\n\n` +
+      'Reuse the home page\'s exact <head> setup (fonts, Tailwind config, colors), header, <nav> and footer, ' +
+      'with the nav linking every page above. Fill the body with real, specific content for this page. ' +
+      'Forms must use action="#". No iframes. Return one complete HTML document only.\n\n' +
+      `HOME PAGE (index.html), for style reference:\n${reference}`,
+      'You are a senior web designer extending an existing website with a matching page. Reply with HTML only.'));
+    } catch (e) {
+      log(`page ${p.file} skipped: ${sanitize(e?.message || e)}`);
+      continue;
+    }
+    const html = stripFences(res?.text);
+    if (!/<html[\s>]/i.test(html) || !/<\/html>/i.test(html)) continue;
+    fs.writeFileSync(path.join(out, p.file), html, 'utf8');
+    done.push({ file: p.file, option: 1, name: p.title, inspiration: '' });
+  }
+  if (!done.length) return [];
+  // Give the home page the same navigation as the new pages.
+  const nav = firstNav(fs.readFileSync(path.join(out, done[0].file), 'utf8'));
+  let home = index;
+  if (nav && firstNav(home)) {
+    home = home.replace(firstNav(home), () => nav);
+  } else {
+    const links = [{ file: 'index.html', name: 'Home' }, ...done].map((p) => `<a href="${p.file}" style="margin:0 .6rem">${p.name.replace(/[<>&"]/g, '')}</a>`).join('');
+    home = home.replace(/<\/body>/i, () => `<nav style="text-align:center;padding:1.5rem 0">${links}</nav>\n</body>`);
+  }
+  fs.writeFileSync(path.join(out, 'index.html'), home, 'utf8');
+  return done;
 }
 
 async function modify(req, engine) {
@@ -240,7 +365,15 @@ async function modify(req, engine) {
     return { ok: false, error: failure(phase, 'The AI did not apply the change') };
   }
   fs.writeFileSync(path.join(req.out_dir, 'index.html'), html, 'utf8');
-  return { ok: true, brand_name: req.brand_name || '', pages: [{ file: 'index.html', option: 1, name: '', inspiration: '' }],
+  // A change rewrites the home page; the site's other pages carry over unchanged.
+  const kept = [];
+  for (const f of fs.readdirSync(req.base_dir)) {
+    if (/^[a-z][a-z0-9-]{1,19}\.html$/.test(f) && !RESERVED_PAGES.has(f.slice(0, -5))) {
+      fs.copyFileSync(path.join(req.base_dir, f), path.join(req.out_dir, f));
+      kept.push({ file: f, option: 1, name: '', inspiration: '' });
+    }
+  }
+  return { ok: true, brand_name: req.brand_name || '', pages: [{ file: 'index.html', option: 1, name: '', inspiration: '' }, ...kept],
     truncated_input: current.length > 8000 };
 }
 

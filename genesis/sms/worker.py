@@ -259,8 +259,23 @@ class SmsWorker:
             project = self.store.project(job["user_id"], job["project_id"])
         self.store.update_job(job["id"], status="succeeded", error=None)
         event("sms.job_succeeded", ref=job["ref"], build=build["id"], kind="website")
-        url = self.service.preview_url(job["user_id"], build["id"], relative_ok=bool(user and user["channel"] == "web"))
         verb = "updated" if job["kind"] == "change" else "ready"
+        if project and self.s.website_deploy == "weave" and self.s.sites_domain:
+            # Weave hosting: every finished version goes live on its own subdomain straight away.
+            try:
+                live = self._host_on_weave(project, build["id"])
+            except (OSError, ValueError, RuntimeError) as e:
+                logging.getLogger("genesis.sms").exception("weave hosting failed for %s", job["ref"])
+                live = None
+                event("sms.host_failed", logging.WARNING, ref=job["ref"], error=type(e).__name__)
+            if live:
+                text = (f"Your website {M.name_of(project)} is {verb} and live!\nOpen it here: {live}\n"
+                        "Want changes? Just tell me, like \"make the top darker\".")
+                if self.nlg:
+                    text = self.nlg.present("website_succeeded", {"project_name": M.name_of(project),
+                                                                  "build_ref": job["ref"], "url": live}, text)
+                return self._notify(job, user, text)
+        url = self.service.preview_url(job["user_id"], build["id"], relative_ok=bool(user and user["channel"] == "web"))
         lines = [f"Your website {M.name_of(project)} is {verb}!"]
         lines.append(f"Open it here: {url}" if url else "(The link isn't set up on the Weave server yet.)")
         lines.append(f"This link is private, just for you, and works for {M.duration(self.s.sms_link_ttl_hours)}. "
@@ -276,6 +291,17 @@ class SmsWorker:
             fallback_web = self.nlg.present("website_succeeded", {"project_name": M.name_of(project), "build_ref": job["ref"], "url": url}, fallback_web)
         self._notify(job, user, fallback_web)
 
+    def _host_on_weave(self, project: dict, build_id: str) -> str:
+        """Publish one website version to https://<name>.<sites_domain>/ and record it on the project."""
+        from ..web.hosting import publish_hosted, site_label, site_url
+
+        label = site_label(self.s.hosted_dir, project.get("name") or "", project.get("deploy_site_id"))
+        publish_hosted(self.s.hosted_dir, self.websites.site_dir(build_id), label)
+        url = site_url(label, self.s.sites_domain)
+        self.store.update_project(project["id"], deploy_url=url, deploy_site_id=label)
+        event("sms.hosted", site=label)
+        return url
+
     def _publish(self, job: dict, user: dict | None, project: dict | None) -> None:
         """Run an owner-approved publish of one exact website version. Never retried automatically."""
         from ..web.deploy import PublishError, publish
@@ -289,6 +315,14 @@ class SmsWorker:
         if problem:
             self.store.update_job(job["id"], status="failed", error=f"Publish refused: {problem}")
             return self._notify(job, user, f"{job['ref']}: not published ({problem}).")
+        if self.s.website_deploy == "weave":
+            try:
+                url = self._host_on_weave(project, build_id)
+            except (OSError, ValueError, RuntimeError) as e:
+                self.store.update_job(job["id"], status="failed", error=f"Weave hosting failed: {e}")
+                return self._notify(job, user, f"{job['ref']}: publishing failed. Your private preview still works.")
+            self.store.update_job(job["id"], status="succeeded", build_id=build_id, error=None)
+            return self._notify(job, user, f"Published! {M.name_of(project)} is live at {url}\nBuild: {job['ref']}")
         try:
             out = (self.publisher or publish)(self.s.netlify_auth_token, self.websites.site_dir(build_id),
                                                brand=project.get("name") or "", site_id=project.get("deploy_site_id"))
