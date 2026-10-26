@@ -317,12 +317,21 @@ class Settings:
 
     def __post_init__(self) -> None:
         if self.ai_provider == "glm":
-            # Every AI call goes to GLM: the Gemini code paths stay, pointed at the GLM key and models.
-            fallbacks = [m.strip() for m in self.glm_fallback_models.split(",") if m.strip()]
-            self.gemini_api_key = self.glm_api_key
+            # GLM answers first. When it's busy (the free key takes one request at a time), refuses or runs out,
+            # the Gemini models take over, if GEMINI_API_KEY is set. GeminiClient and the website bridge send
+            # glm-* models to GLM and the rest to Gemini.
+            def split(models: str) -> list[str]:
+                return [m.strip() for m in models.split(",") if m.strip()]
+
+            glm_backups = split(self.glm_fallback_models)
+            gemini_chat = [self.chat_model] if self.gemini_api_key and self.chat_model else []
+            gemini_web = []
+            if self.gemini_api_key:
+                main = self.gemini_model if self.gemini_model != "auto" else "gemini-3.5-flash"
+                gemini_web = list(dict.fromkeys([main, *split(self.website_fallback_models)]))
             self.gemini_model = self.chat_model = self.nlg_model = self.glm_model
-            self.chat_fallback_model = fallbacks[0] if fallbacks else ""
-            self.website_fallback_models = ",".join(fallbacks)
+            self.chat_fallback_model = (glm_backups + gemini_chat + [""])[0]
+            self.website_fallback_models = ",".join(glm_backups + gemini_web)
 
     def sms_issues(self) -> list[str]:
         """Configuration problems that stop the messaging channels from working (names only, never values)."""
@@ -454,7 +463,7 @@ class Settings:
             return "Node.js was not found (install Node 20+ or set GENESIS_NODE_BIN)"
         if self.ai_backend != "api":
             return "the website engine needs the Gemini API backend (GENESIS_AI_BACKEND=api)"
-        if not self.gemini_api_key:
+        if not self.gemini_api_key and not (self.ai_provider == "glm" and self.glm_api_key):
             return "GEMINI_API_KEY is missing"
         return ""
 

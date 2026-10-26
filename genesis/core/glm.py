@@ -1,7 +1,8 @@
 """GLM (Zhipu / Z.ai) behind the same `client.models` calls GeminiClient makes with google-genai.
 
-With GENESIS_AI_PROVIDER=glm, GeminiClient talks to this instead of Gemini, so its retries, model fallback, chat
-racing and schema checks work unchanged. GLM speaks the OpenAI chat format: the system prompt becomes a system
+With GENESIS_AI_PROVIDER=glm, GeminiClient talks to this (through RoutedModels, which still sends Gemini model
+names to Gemini) instead of Gemini directly, so its retries, model fallback, chat racing and schema checks work
+unchanged. GLM speaks the OpenAI chat format: the system prompt becomes a system
 message, a JSON schema is spelled out in it (GLM's JSON mode takes no schema), and thinking is turned off so
 replies come back in seconds."""
 
@@ -71,6 +72,25 @@ class GlmModels:
             usage_metadata=types.SimpleNamespace(prompt_token_count=usage.get("prompt_tokens"),
                                                  candidates_token_count=usage.get("completion_tokens")),
             candidates=[types.SimpleNamespace(finish_reason=choice.get("finish_reason"))])
+
+
+class RoutedModels:
+    """glm-* models go to GLM and every other model to Gemini, so one list of models can mix the two: GLM first,
+    Gemini taking over when GLM is busy or out of quota."""
+
+    def __init__(self, glm: GlmModels, gemini=None):
+        self.glm = glm
+        self.gemini = gemini  # google-genai `client.models`, or None without a Gemini key
+
+    def list(self, config=None):
+        return self.glm.list() + (list(self.gemini.list(config=config)) if self.gemini is not None else [])
+
+    def generate_content(self, model: str, contents: str, config):
+        if model.startswith("glm"):
+            return self.glm.generate_content(model=model, contents=contents, config=config)
+        if self.gemini is None:
+            raise GlmError(400, f"{model} is a Gemini model, but GEMINI_API_KEY is not set")
+        return self.gemini.generate_content(model=model, contents=contents, config=config)
 
 
 def _error(r: httpx.Response) -> GlmError:

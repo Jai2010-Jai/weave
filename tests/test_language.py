@@ -202,3 +202,33 @@ def test_a_model_out_of_quota_falls_through_to_the_next(settings):
     out, meta = client._structured("system", "user", Translation)
     assert out.text == "ok" and meta["model"] == "gemini-3.5-flash-lite" and asked == ["spent-model",
                                                                                          "gemini-3.5-flash-lite"]
+
+
+def test_glm_answers_first_and_gemini_takes_over_when_it_is_busy(tmp_path):
+    from genesis.config import Settings
+    from genesis.core.gemini import GeminiClient
+    from genesis.core.glm import GlmError, RoutedModels
+
+    s = Settings(data_dir=tmp_path, ai_provider="glm", glm_api_key="glm-test", gemini_api_key="gemini-test",
+                 gemini_model="auto", chat_model="gemini-3.5-flash-lite", glm_fallback_models="",
+                 website_fallback_models="gemini-2.5-flash")
+    assert (s.chat_model, s.chat_fallback_model) == ("glm-4.7-flash", "gemini-3.5-flash-lite")
+    assert s.website_fallback_models == "gemini-3.5-flash,gemini-2.5-flash"
+
+    asked = []
+
+    class Busy:
+        def generate_content(self, model, contents, config):
+            asked.append(model)
+            raise GlmError(503, "UNAVAILABLE: GLM is overloaded (1305)")
+
+    class Gemini:
+        def generate_content(self, model, contents, config):
+            asked.append(model)
+            return types.SimpleNamespace(text='{"text": "from gemini"}', usage_metadata=None, candidates=[])
+
+    client = GeminiClient(s)
+    client._client = types.SimpleNamespace(models=RoutedModels(Busy(), Gemini()))
+    client._available_models = {"glm-4.7-flash", "gemini-3.5-flash", "gemini-2.5-flash"}
+    out, meta = client._structured("system", "user", Translation)
+    assert out.text == "from gemini" and asked == ["glm-4.7-flash", "gemini-3.5-flash"]

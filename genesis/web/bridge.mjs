@@ -235,11 +235,13 @@ async function loadEngine(engineDir) {
 
   geminiClient.generateViaAgy = async () => { throw new Error('agy CLI is disabled by Genesis'); };
   geminiClient.resolveCloudCodeProject = async () => { throw new Error('Cloud Code OAuth is disabled by Genesis'); };
-  const original = process.env.GENESIS_AI_PROVIDER === 'glm'
-    ? (prompt, system, config) => glmGenerate(geminiClient.model, geminiClient.apiKey, prompt, system, config)
-    : geminiClient.generateContent.bind(geminiClient);
+  // glm-* models go to GLM, every other model to Gemini, so GLM can answer first with Gemini as the fallback.
+  const gemini = geminiClient.generateContent.bind(geminiClient);
+  const original = (prompt, system, config) => (String(geminiClient.model).startsWith('glm')
+    ? glmGenerate(geminiClient.model, process.env.GLM_API_KEY, prompt, system, config)
+    : gemini(prompt, system, config));
   geminiClient.generateContent = async (prompt, system, config) => {
-    if (!geminiClient.apiKey) {
+    if (!geminiClient.apiKey && !process.env.GLM_API_KEY) {
       const err = new Error('GEMINI_API_KEY is not set for the website engine');
       calls.push({ phase, ok: false, error: err.message });
       throw err;
@@ -266,7 +268,9 @@ async function loadEngine(engineDir) {
 
     async function ask(model) {
       let lastError;
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      // glmGenerate already retries busy answers itself, so a GLM failure moves straight on to the next model.
+      const tries = model.startsWith('glm') ? 1 : 2;
+      for (let attempt = 1; attempt <= tries; attempt++) {
         const thinking = thinkingFor(model);
         const cfg = thinking ? { ...(config || {}), thinkingConfig: thinking } : config;
         const started = Date.now();
@@ -296,12 +300,12 @@ async function loadEngine(engineDir) {
             e.fatal = true; // a bad request fails the same way on every model
             throw e;
           }
-          if (attempt === 2) {
+          if (attempt === tries) {
             busyModels.add(model);
             markHealth(model, true);
           }
-          log(`Gemini busy on ${model} (${ph}); ${attempt < 2 ? 'retrying' : 'trying the next model'}`);
-          if (attempt < 2) await new Promise((r) => setTimeout(r, pause * attempt));
+          log(`AI busy on ${model} (${ph}); ${attempt < tries ? 'retrying' : 'trying the next model'}`);
+          if (attempt < tries) await new Promise((r) => setTimeout(r, pause * attempt));
         }
       }
       throw lastError;

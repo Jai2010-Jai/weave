@@ -62,16 +62,22 @@ class GeminiClient:
 
     @property
     def configured(self) -> bool:
-        return bool(self.s.gemini_api_key)
+        return bool(self.s.gemini_api_key) or (self.s.ai_provider == "glm" and bool(self.s.glm_api_key))
 
     def _get_client(self):
         if not self.configured:
             raise GeminiError("GEMINI_API_KEY is not set. Add it to .env (see README) and restart Genesis.")
         if self._client is None and self.s.ai_provider == "glm":
-            from .glm import GlmModels
+            from .glm import GlmModels, RoutedModels
 
-            models = [self.s.glm_model] + [m for m in self.s.website_fallback_models.split(",") if m]
-            self._client = SimpleNamespace(models=GlmModels(self.s.gemini_api_key, self.s.glm_base_url, models))
+            glm_models = [m for m in [self.s.glm_model, *self.s.website_fallback_models.split(",")] if m.startswith("glm")]
+            gemini = None
+            if self.s.gemini_api_key:
+                from google import genai
+
+                gemini = genai.Client(api_key=self.s.gemini_api_key).models
+            glm = GlmModels(self.s.glm_api_key, self.s.glm_base_url, glm_models)
+            self._client = SimpleNamespace(models=RoutedModels(glm, gemini))
         if self._client is None:
             from google import genai  # imported lazily so tests run without network
 
@@ -243,7 +249,8 @@ class GeminiClient:
         # Fast bounded backoff for interactive requests:
         delays = (0, 1, 3) if (timeout and timeout <= 30) else (0, 2, 6)
         for m in candidates:
-            for delay in delays:
+            # GLM calls already retry busy answers themselves; a GLM failure moves straight on to the next model.
+            for delay in (0,) if m.startswith("glm") else delays:
                 if delay:
                     log.warning("Gemini transient error on %s; retrying in %ss", m, delay)
                     time.sleep(delay)
