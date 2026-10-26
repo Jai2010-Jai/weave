@@ -95,6 +95,7 @@ def make_test_settings(tmp_path: str = "/tmp/test-genesis") -> Settings:
     )
     s.sms_provider = "log"
     s.website_engine_dir = ""  # independent of the developer's .env
+    s.sms_signup = "link"  # the documented default, whatever the local .env says
     s.public_base_url = "https://genesis.example.test"
     s.twilio_account_sid = "AC" + "0" * 32
     s.twilio_auth_token = "test-twilio-auth-token"

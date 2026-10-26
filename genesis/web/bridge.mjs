@@ -123,6 +123,59 @@ const RESEARCH_SCHEMA = {
   required: ['topicAnalysis', 'inspirations'],
 };
 
+// Speed. Gemini 3 models think before answering by default, and that was most of a build's time (research:
+// 379 s for 1.7k output tokens). Low thinking keeps page quality at a fraction of the wait.
+const THINKING = process.env.GENESIS_WEBSITE_THINKING || 'low';
+const noThinking = new Set(); // models that rejected a thinking setting: sent without one from then on
+function thinkingFor(model) {
+  if (THINKING === 'default' || noThinking.has(model)) return null;
+  if (/^gemini-2\.5-flash/.test(model)) return { thinkingBudget: 0 };
+  if (/^gemini-2\.5/.test(model)) return { thinkingBudget: 128 };
+  return { thinkingLevel: THINKING };
+}
+// Unbounded pages reached 86 KB (27k output tokens, 8 minutes of generation) without looking better.
+const LENGTH_BUDGET = '\n\nLENGTH BUDGET: one focused page of about 400-700 lines of HTML (roughly 25-40 KB). Prefer fewer, ' +
+  'richer sections over long repeated ones. No duplicated blocks, no placeholder filler.' +
+  '\n\nSAFETY: never add password, payment card, CVV or one-time-code inputs, and no login or sign-in forms; ' +
+  'use a contact or enquiry form (name, email, phone, message) when a form is needed.';
+const BUDGETED = /^(?:html-\d|redesign|pages)$/;
+// How long a model may stay silent before the same request also goes to the next model. Healthy calls take
+// 10-30 s for research and plans and 60-140 s for a page; overloaded ones were seen taking 5-6 minutes.
+const HEDGE_MS = { research: 45_000, 'pages-plan': 25_000 };
+function hedgeAfter(p) {
+  const override = Number(process.env.GENESIS_HEDGE_MS || 0);
+  if (override) return override;
+  return HEDGE_MS[p] ?? (BUDGETED.test(p) ? 150_000 : 60_000);
+}
+
+// Model health shared by all builds, including parallel ones: a model that was overloaded in the last few
+// minutes is tried last, so each build doesn't lose a minute rediscovering it.
+const HEALTH_FILE = process.env.GEMINI_HEALTH_FILE || '';
+const HEALTH_TTL_MS = 10 * 60_000;
+function readHealth() {
+  try {
+    return JSON.parse(fs.readFileSync(HEALTH_FILE, 'utf8')) || {};
+  } catch {
+    return {};
+  }
+}
+function markHealth(model, busy) {
+  if (!HEALTH_FILE) return;
+  try {
+    const h = readHealth();
+    if (!busy && !h[model]) return;
+    h[model] = busy ? Date.now() : 0;
+    const tmp = `${HEALTH_FILE}.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(h));
+    fs.renameSync(tmp, HEALTH_FILE);
+  } catch {
+    // best effort: health is only an ordering hint
+  }
+}
+function recentlyBusy(model) {
+  return HEALTH_FILE !== '' && Date.now() - (readHealth()[model] || 0) < HEALTH_TTL_MS;
+}
+
 const calls = [];
 const busyModels = new Set();
 const TRANSIENT = /\((?:429|500|502|503|504)\)|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|fetch failed|ECONNRESET|ETIMEDOUT|socket hang up/i;
@@ -152,42 +205,106 @@ async function loadEngine(engineDir) {
     if (phase === 'research' && !config) {
       // weave parses this reply as JSON but doesn't ask for JSON; without JSON mode Gemini sometimes returns
       // invalid JSON and weave silently switches to canned directions.
-      config = { responseMimeType: 'application/json', responseJsonSchema: RESEARCH_SCHEMA };
+      // A normal reply is ~1,500 tokens; one ran away to 32,000 (2.5 minutes). The cap cuts that short.
+      config = { responseMimeType: 'application/json', responseJsonSchema: RESEARCH_SCHEMA, maxOutputTokens: 8192 };
     }
-    // Gemini regularly answers 503 "high demand" (also 429/500). Each model gets a retry, then the next model in
-    // GEMINI_FALLBACK_MODELS takes over: different model families have separate capacity.
+    // Gemini regularly answers 503 "high demand" (also 429/500), and an overloaded model can also just stall for
+    // minutes. Each model gets a retry; a failure moves on to the next model in GEMINI_FALLBACK_MODELS, and a
+    // model that hasn't answered within hedgeAfter(phase) gets company: the same request also goes to the next
+    // model and the first good answer wins. Different model families have separate capacity.
     const primary = geminiClient.model;
     const all = [...new Set([primary, ...String(process.env.GEMINI_FALLBACK_MODELS || '').split(',').map((m) => m.trim()).filter(Boolean)])];
-    // Models that were overloaded earlier in this build go last, so later pages don't wait on them again.
-    const models = [...all.filter((m) => !busyModels.has(m)), ...all.filter((m) => busyModels.has(m))];
+    // Models that were overloaded earlier in this build, or recently in any build, go last.
+    const slow = (m) => busyModels.has(m) || recentlyBusy(m);
+    const models = [...all.filter((m) => !slow(m)), ...all.filter(slow)];
+    const ph = phase;
+    const sys = BUDGETED.test(ph) ? (system || '') + LENGTH_BUDGET : system;
     const pause = Number(process.env.GENESIS_RESEARCH_RETRY_MS ?? 5000);
-    let lastError;
-    try {
-      for (const model of models) {
-        for (let attempt = 1; attempt <= 2; attempt++) {
-          geminiClient.model = model;
-          const started = Date.now();
-          try {
-            const res = await original(prompt, system, config);
-            const usage = res?.raw?.usageMetadata || {};
-            calls.push({ phase, ok: true, model, ms: Date.now() - started,
-              input_tokens: usage.promptTokenCount ?? null, output_tokens: usage.candidatesTokenCount ?? null });
-            aiText[phase] = res?.text || '';
-            return res;
-          } catch (e) {
-            calls.push({ phase, ok: false, model, ms: Date.now() - started, error: sanitize(e.message) });
-            lastError = e;
-            if (!TRANSIENT.test(String(e?.message))) throw e;
-            if (attempt === 2) busyModels.add(model);
-            log(`Gemini busy on ${model} (${phase}); ${attempt < 2 ? 'retrying' : 'trying the next model'}`);
-            if (attempt < 2) await new Promise((r) => setTimeout(r, pause * attempt));
+    const race = { settled: false };
+
+    async function ask(model) {
+      let lastError;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const thinking = thinkingFor(model);
+        const cfg = thinking ? { ...(config || {}), thinkingConfig: thinking } : config;
+        const started = Date.now();
+        // A call that loses the race still costs tokens: it is recorded, but under its own phase name so it
+        // never counts as this phase's answer.
+        const record = (entry) => calls.push({ phase: race.settled ? `${ph}:late` : ph, model, ms: Date.now() - started, ...entry });
+        try {
+          geminiClient.model = model; // read synchronously when the request starts, so parallel calls are safe
+          const pending = original(prompt, sys, cfg);
+          geminiClient.model = primary;
+          const res = await pending;
+          const usage = res?.raw?.usageMetadata || {};
+          record({ ok: true, input_tokens: usage.promptTokenCount ?? null, output_tokens: usage.candidatesTokenCount ?? null,
+            thinking_tokens: usage.thoughtsTokenCount ?? null });
+          markHealth(model, false);
+          return res;
+        } catch (e) {
+          geminiClient.model = primary;
+          record({ ok: false, error: sanitize(e.message) });
+          lastError = e;
+          if (thinking && /\(400\)/.test(String(e?.message)) && /think/i.test(String(e?.message))) {
+            noThinking.add(model); // this model takes no thinking setting: ask again without one
+            attempt--;
+            continue;
           }
+          if (!TRANSIENT.test(String(e?.message))) {
+            e.fatal = true; // a bad request fails the same way on every model
+            throw e;
+          }
+          if (attempt === 2) {
+            busyModels.add(model);
+            markHealth(model, true);
+          }
+          log(`Gemini busy on ${model} (${ph}); ${attempt < 2 ? 'retrying' : 'trying the next model'}`);
+          if (attempt < 2) await new Promise((r) => setTimeout(r, pause * attempt));
         }
       }
       throw lastError;
-    } finally {
-      geminiClient.model = primary;
     }
+
+    const res = await new Promise((resolve, reject) => {
+      let next = 0;
+      let running = 0;
+      let lastError;
+      let timer;
+      const finish = (fn, value) => {
+        if (race.settled) return;
+        race.settled = true;
+        clearTimeout(timer);
+        fn(value);
+      };
+      const launch = () => {
+        clearTimeout(timer);
+        if (race.settled) return;
+        if (next >= models.length) {
+          if (!running) finish(reject, lastError);
+          return;
+        }
+        const model = models[next++];
+        running++;
+        if (next < models.length) {
+          timer = setTimeout(() => {
+            log(`${model} is slow on ${ph}; also asking ${models[next]}`);
+            launch();
+          }, hedgeAfter(ph));
+        }
+        ask(model).then((r) => {
+          running--;
+          finish(resolve, r);
+        }, (e) => {
+          running--;
+          lastError = e;
+          if (e?.fatal) next = models.length; // no point asking more models; let a call already running finish
+          launch();
+        });
+      };
+      launch();
+    });
+    aiText[ph] = res?.text || '';
+    return res;
   };
   return { research, bespoke, gemini: geminiClient };
 }
@@ -241,7 +358,10 @@ async function generate(req, engine) {
       break; // extra design options are optional
     }
     const file = i === 0 ? 'index.html' : `option${i + 1}.html`;
-    fs.writeFileSync(path.join(out, file), html, 'utf8');
+    // Written whole (temp file + rename): Genesis publishes index.html the moment it appears, while extra pages
+    // are still being written.
+    fs.writeFileSync(path.join(out, `.${file}.tmp`), html, 'utf8');
+    fs.renameSync(path.join(out, `.${file}.tmp`), path.join(out, file));
     pages.push({ file, option: i + 1, name: String(inspirations[i]?.name || '').slice(0, 120),
       inspiration: String(inspirations[i]?.sourceInspiration || '').slice(0, 200) });
   }
@@ -299,7 +419,17 @@ async function withRetry(fn) {
   }
 }
 
+// Milliseconds left before optional work (extra pages) must stop; Infinity without a deadline.
+function timeLeft() {
+  const deadline = Number(process.env.WEBSITE_DEADLINE_MS || 0);
+  return deadline ? deadline - Date.now() : Infinity;
+}
+
 async function addPages(req, engine, topic, out, extra) {
+  if (timeLeft() < 60_000) {
+    log('no time left for extra pages; shipping the home page');
+    return [];
+  }
   const index = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
   phase = 'pages-plan';
   const plan = await withRetry(() => engine.gemini.generateContent(
@@ -320,9 +450,11 @@ async function addPages(req, engine, topic, out, extra) {
   if (!wanted.length) return [];
   const navList = [{ file: 'index.html', title: 'Home' }, ...wanted].map((p) => `${p.title} -> ${p.file}`).join('\n');
   const reference = index.slice(0, 14000);
-  const done = [];
-  for (const p of wanted) {
-    phase = `page-${p.file}`;
+  // Pages are written in parallel: each is a few minutes of Gemini output, so one after another took far too long.
+  phase = 'pages';
+  let closed = false;  // set when out of time: late pages are dropped, never half-linked
+  const finished = [];
+  const all = Promise.all(wanted.map(async (p) => {
     let res;
     try {
       res = await withRetry(() => engine.gemini.generateContent(
@@ -335,14 +467,29 @@ async function addPages(req, engine, topic, out, extra) {
       'You are a senior web designer extending an existing website with a matching page. Reply with HTML only.'));
     } catch (e) {
       log(`page ${p.file} skipped: ${sanitize(e?.message || e)}`);
-      continue;
+      return null;
     }
     const html = stripFences(res?.text);
-    if (!/<html[\s>]/i.test(html) || !/<\/html>/i.test(html)) continue;
+    if (closed || !/<html[\s>]/i.test(html) || !/<\/html>/i.test(html)) return;
     fs.writeFileSync(path.join(out, p.file), html, 'utf8');
-    done.push({ file: p.file, option: 1, name: p.title, inspiration: '' });
-  }
+    finished.push({ file: p.file, option: 1, name: p.title, inspiration: '' });
+  }));
+  let timer;
+  await Promise.race([all, new Promise((r) => { timer = setTimeout(r, Math.max(0, timeLeft())); })]);
+  clearTimeout(timer);
+  closed = true;
+  if (finished.length < wanted.length) log(`out of time for extra pages; shipping ${finished.length} of ${wanted.length}`);
+  // Keep the planned order; the nav lists only pages that exist.
+  const done = wanted.map((p) => finished.find((f) => f.file === p.file)).filter(Boolean);
   if (!done.length) return [];
+  // Pages that missed the deadline are still linked from the ones that made it: point those links home.
+  const missing = wanted.filter((p) => !done.some((d) => d.file === p.file)).map((p) => p.file);
+  for (const d of done) {
+    const f = path.join(out, d.file);
+    let html = fs.readFileSync(f, 'utf8');
+    for (const m of missing) html = html.split(`href="${m}"`).join('href="index.html"');
+    fs.writeFileSync(f, html, 'utf8');
+  }
   // Give the home page the same navigation as the new pages.
   const nav = firstNav(fs.readFileSync(path.join(out, done[0].file), 'utf8'));
   let home = index;
@@ -391,7 +538,8 @@ async function main() {
     result = { ok: false, error: sanitize(e?.message || e) };
   }
   result.calls = calls;
-  process.stdout.write(JSON.stringify(result) + '\n');
+  // Exit explicitly: Gemini requests abandoned after the page deadline must not keep the build open.
+  process.stdout.write(JSON.stringify(result) + '\n', () => process.exit(0));
 }
 
 main();

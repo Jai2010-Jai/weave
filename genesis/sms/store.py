@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .accounts_store import AccountsMixin
+
 REF_ALPHABET = "23456789ABCDEFGHJKMNPQRSTVWXYZ"
 ACTIVE_JOB_STATES = ("queued", "running")
 STATUS_PRECEDENCE: dict[str, int] = {
@@ -137,7 +139,7 @@ def sha256(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-class SmsStore:
+class SmsStore(AccountsMixin):
     def __init__(self, path: Path):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -155,8 +157,17 @@ class SmsStore:
             c.execute("ALTER TABLE users ADD COLUMN reply_from TEXT")
         if "pending_text" not in cols:  # a message waiting for "new app or change?" to be answered
             c.execute("ALTER TABLE users ADD COLUMN pending_text TEXT")
-        if "pending_question" not in cols:  # what pending_text is waiting on: NULL (new or change?) | kind | publish
+        if "pending_question" not in cols:  # what pending_text is waiting on: NULL (new or change?) | kind | style | publish
             c.execute("ALTER TABLE users ADD COLUMN pending_question TEXT")
+        if "referral_code" not in cols:  # this user's shareable code; friends text JOIN <code> to sign up
+            c.execute("ALTER TABLE users ADD COLUMN referral_code TEXT")
+        if "referred_by" not in cols:
+            c.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+        if "bonus_builds" not in cols:  # extra daily builds earned by referring friends
+            c.execute("ALTER TABLE users ADD COLUMN bonus_builds INTEGER NOT NULL DEFAULT 0")
+        if "language" not in cols:  # genesis.sms.language code (hi, te-Latn, ...); NULL = English
+            c.execute("ALTER TABLE users ADD COLUMN language TEXT")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code ON users(referral_code)")
         mcols = {r["name"] for r in c.execute("PRAGMA table_info(messages)").fetchall()}
         if "sender" not in mcols:
             c.execute("ALTER TABLE messages ADD COLUMN sender TEXT")
@@ -172,6 +183,7 @@ class SmsStore:
             c.execute("ALTER TABLE projects ADD COLUMN deploy_url TEXT")
         if "deploy_site_id" not in pcols:
             c.execute("ALTER TABLE projects ADD COLUMN deploy_site_id TEXT")
+        self._migrate_accounts(c)
 
     # ---------- connection ----------
     def _conn(self) -> sqlite3.Connection:
@@ -257,6 +269,47 @@ class SmsStore:
             c.execute("UPDATE link_codes SET used_at = ?, used_by = ? WHERE code_hash = ?", (now, user["id"], row["code_hash"]))
         return dict(user)
 
+    # ---------- referrals ----------
+    def referral_code(self, user_id: int) -> str:
+        """The user's shareable referral code, created on first use."""
+        row = self.one("SELECT referral_code FROM users WHERE id = ?", (user_id,))
+        if row and row["referral_code"]:
+            return row["referral_code"]
+        for _ in range(20):
+            code = "".join(secrets.choice(REF_ALPHABET) for _ in range(6))
+            try:
+                with self.tx() as c:
+                    c.execute("UPDATE users SET referral_code = ? WHERE id = ? AND referral_code IS NULL", (code, user_id))
+            except sqlite3.IntegrityError:
+                continue
+            return self.one("SELECT referral_code FROM users WHERE id = ?", (user_id,))["referral_code"]
+        raise RuntimeError("could not create a referral code")
+
+    def referral_count(self, user_id: int) -> int:
+        return self.one("SELECT COUNT(*) AS n FROM users WHERE referred_by = ?", (user_id,))["n"]
+
+    def consume_referral_code(self, raw: str, phone: str, channel: str, role: str, bonus: int,
+                              max_referrals: int) -> tuple[dict, dict] | None:
+        """Atomically sign up a new user with a friend's code and credit the friend.
+        Returns (new_user, referrer), or None if the code is unknown, its owner is inactive or out of invites."""
+        code = "".join(ch for ch in raw.upper() if ch.isalnum())
+        if not code:
+            return None
+        now = time.time()
+        with self.tx() as c:
+            ref = c.execute("SELECT * FROM users WHERE referral_code = ? AND status = 'active'", (code,)).fetchone()
+            if not ref or ref["phone"] == phone:
+                return None
+            used = c.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (ref["id"],)).fetchone()[0]
+            if used >= max_referrals:
+                return None
+            c.execute("INSERT OR IGNORE INTO users (phone, role, channel, created_at, linked_at, referred_by) "
+                      "VALUES (?, ?, ?, ?, ?, ?)", (phone, role, channel, now, now, ref["id"]))
+            c.execute("UPDATE users SET bonus_builds = bonus_builds + ? WHERE id = ?", (bonus, ref["id"]))
+            user = c.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()
+            ref = c.execute("SELECT * FROM users WHERE id = ?", (ref["id"],)).fetchone()
+        return dict(user), dict(ref)
+
     # ---------- projects ----------
     def create_project(self, user_id: int, prompt: str, kind: str = "android") -> dict:
         if kind not in ("android", "website"):
@@ -276,10 +329,11 @@ class SmsStore:
         return self.one("SELECT * FROM projects WHERE id = ? AND user_id = ?", (project_id, user_id))
 
     def project_by_number(self, user_id: int, number: int) -> dict | None:
-        return self.one("SELECT * FROM projects WHERE user_id = ? AND number = ?", (user_id, number))
+        return self.one("SELECT * FROM projects WHERE user_id = ? AND number = ? AND deleted_at IS NULL", (user_id, number))
 
     def projects(self, user_id: int, limit: int = 8) -> list[dict]:
-        return self.all("SELECT * FROM projects WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?", (user_id, limit))
+        return self.all("SELECT * FROM projects WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT ?",
+                        (user_id, limit))
 
     def update_project(self, project_id: int, **fields: Any) -> None:
         fields["updated_at"] = time.time()
@@ -395,19 +449,27 @@ class SmsStore:
 
     # ---------- outbox ----------
     def enqueue_sms(self, phone: str, body: str, user_id: int | None, job_id: int | None = None,
-                    sender: str | None = None) -> int:
+                    sender: str | None = None, status: str = "pending") -> int:
+        """status 'localizing': held back until release_outbound puts the translated text in."""
         now = time.time()
         with self.tx() as c:
             cur = c.execute("INSERT INTO messages (user_id, phone, direction, body, status, next_attempt_at, job_id, "
-                            "sender, created_at, updated_at) VALUES (?, ?, 'out', ?, 'pending', ?, ?, ?, ?, ?)",
-                            (user_id, phone, body, now, job_id, sender, now, now))
+                            "sender, created_at, updated_at) VALUES (?, ?, 'out', ?, ?, ?, ?, ?, ?, ?)",
+                            (user_id, phone, body, status, now, job_id, sender, now, now))
             return cur.lastrowid  # type: ignore[return-value]
+
+    def release_outbound(self, msg_id: int, body: str) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE messages SET body = ?, status = 'pending', updated_at = ? WHERE id = ? AND status = 'localizing'",
+                      (body, time.time(), msg_id))
 
     def claim_outbound(self, lease_s: float = 60, limit: int = 10) -> list[dict]:
         now = time.time()
         with self.tx() as c:
+            # A translation that never came back (crash, restart) goes out in English after a minute.
             rows = c.execute("SELECT * FROM messages WHERE direction = 'out' AND ((status = 'pending' AND next_attempt_at <= ?)"
-                             " OR (status = 'sending' AND lease_until < ?)) ORDER BY id LIMIT ?", (now, now, limit)).fetchall()
+                             " OR (status = 'sending' AND lease_until < ?) OR (status = 'localizing' AND updated_at < ?))"
+                             " ORDER BY id LIMIT ?", (now, now, now - 60, limit)).fetchall()
             for r in rows:
                 c.execute("UPDATE messages SET status = 'sending', lease_until = ?, attempts = attempts + 1, updated_at = ? "
                           "WHERE id = ?", (now + lease_s, now, r["id"]))
@@ -485,13 +547,16 @@ class SmsStore:
         row = self.one("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued', 'running')")
         return row["n"] if row else 0
 
-    def claim_job(self, worker_id: str, lease_s: float) -> dict | None:
-        """Take the oldest runnable job. A user never has two jobs running at once."""
+    def claim_job(self, worker_id: str, lease_s: float, lane: str | None = None) -> dict | None:
+        """Take the oldest runnable job. A user never has two jobs running at once.
+        lane: 'website' (website builds and publishes), 'android', or None for any job."""
         now = time.time()
+        lane_sql = {None: "", "website": " AND p.kind = 'website'", "android": " AND p.kind != 'website'"}[lane]
         with self.tx() as c:
-            row = c.execute("SELECT * FROM jobs j WHERE status = 'queued' AND next_run_at <= ? AND NOT EXISTS "
+            row = c.execute("SELECT j.* FROM jobs j JOIN projects p ON p.id = j.project_id "
+                            "WHERE j.status = 'queued' AND j.next_run_at <= ?" + lane_sql + " AND NOT EXISTS "
                             "(SELECT 1 FROM jobs r WHERE r.user_id = j.user_id AND r.status = 'running') "
-                            "ORDER BY next_run_at, id LIMIT 1", (now,)).fetchone()
+                            "ORDER BY j.next_run_at, j.id LIMIT 1", (now,)).fetchone()
             if not row:
                 return None
             c.execute("UPDATE jobs SET status = 'running', lease_owner = ?, lease_until = ?, attempts = attempts + 1, "

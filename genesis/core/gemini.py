@@ -6,11 +6,13 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from pydantic import BaseModel, ValidationError as PydanticValidationError
 
 from ..config import Settings
 from . import prompts
+from .health import ModelHealth
 from .schemas import AppManifest, RepairPatch
 
 log = logging.getLogger("genesis.gemini")
@@ -19,11 +21,28 @@ log = logging.getLogger("genesis.gemini")
 PREFERRED_MODELS = [
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
     "gemini-flash-latest",
+    "gemini-3.8-flash",  # slowest measured (minutes per call under load)
     "gemini-flash-lite-latest",
     "gemini-pro-latest",
 ]
+
+
+# Interactive requests (chat, translation) race a second model when the first is slow; abandoned calls finish here.
+_HEDGE_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="gemini-hedge")
+
+
+def thinking_config(model: str, level: str | None):
+    """The cheapest thinking setting each model family accepts: 2.5 models take a token budget, newer ones a level."""
+    from google.genai import types
+
+    if not level:
+        return None
+    if model.startswith("gemini-2.5-flash"):
+        return types.ThinkingConfig(thinking_budget=0)
+    if model.startswith("gemini-2.5"):
+        return types.ThinkingConfig(thinking_budget=128)
+    return types.ThinkingConfig(thinking_level=level)
 
 
 class GeminiError(RuntimeError):
@@ -37,6 +56,8 @@ class GeminiClient:
         self._model: str | None = None
         self._available_models: set[str] | None = None
         self._lock = threading.RLock()
+        self.health = ModelHealth(settings.data_dir / "gemini-health.json")
+        self._no_thinking: set[str] = set()  # models that rejected a thinking setting
 
     @property
     def configured(self) -> bool:
@@ -96,11 +117,16 @@ class GeminiClient:
         return self._structured(prompts.SYSTEM, prompts.repair_prompt(diagnostics, files, manifest), RepairPatch)
 
     def ask(self, system: str, user: str, schema: type[BaseModel], title: str = "", timeout: int | None = None):
-        """One structured request with a custom system prompt (used by the chat brain and NLG, on GENESIS_CHAT_MODEL if set)."""
-        return self._structured(system, user, schema, model=self.s.chat_model or None, timeout=timeout)
+        """One structured request with a custom system prompt (used by the chat brain and NLG, on GENESIS_CHAT_MODEL if set).
+        Minimal thinking: a chat reply has to arrive in seconds, and these are short routing decisions."""
+        primary = self.s.chat_model or self.model_name()
+        models = [primary] + [m for m in [self.s.chat_fallback_model] if m and m != primary]
+        return self._structured(system, user, schema, model=primary, timeout=timeout, thinking="minimal",
+                                hedge_models=models)
 
     def _structured(self, system: str, user: str, schema: type[BaseModel], attempts: int = 2,
-                    model: str | None = None, timeout: int | None = None):
+                    model: str | None = None, timeout: int | None = None, thinking: str | None = None,
+                    hedge_models: list[str] | None = None):
         from google.genai import types
 
         client = self._get_client()
@@ -117,8 +143,12 @@ class GeminiClient:
                 temperature=0.4,
                 max_output_tokens=60000,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                thinking_config=thinking_config(model, thinking),
             )
-            resp, model = self._call_with_retry(client, model, contents, config, timeout=timeout)
+            if hedge_models:
+                resp, model = self._hedged(client, hedge_models, contents, config, thinking)
+            else:
+                resp, model = self._call_with_retry(client, model, contents, config, timeout=timeout)
             meta = {
                 "model": model,
                 "seconds": round(time.monotonic() - started, 1),
@@ -144,6 +174,53 @@ class GeminiClient:
                 last_err = f"invalid JSON: {e}"
         raise GeminiError(f"Gemini did not return a valid {schema.__name__}: {last_err}")
 
+    def _hedged(self, client, models: list[str], contents: str, config, thinking: str | None):
+        """Ask the first model; if it hasn't answered within chat_hedge_seconds (or fails), ask the next one too and
+        use whichever answers first. For chat, a fast answer matters more than which model gave it."""
+        models = self.health.order(models)
+        pending: dict = {}
+        last: Exception | None = None
+        queue = list(models)
+
+        def start(m: str) -> None:
+            cfg = config.model_copy(update={"thinking_config": thinking_config(m, thinking)})
+            if m in self._no_thinking:
+                cfg = cfg.model_copy(update={"thinking_config": None})
+            pending[_HEDGE_POOL.submit(self._one_call, client, m, contents, cfg)] = m
+
+        start(queue.pop(0))
+        while pending:
+            done, _ = wait(list(pending), timeout=self.s.chat_hedge_seconds if queue else None,
+                           return_when=FIRST_COMPLETED)
+            if not done:
+                log.info("Gemini %s slow; also asking %s", ", ".join(pending.values()), queue[0])
+                start(queue.pop(0))
+                continue
+            for f in done:
+                m = pending.pop(f)
+                try:
+                    resp = f.result()
+                except Exception as e:  # noqa: BLE001
+                    last = e
+                    if _is_transient(e):
+                        self.health.mark(m, True)
+                    if queue:
+                        start(queue.pop(0))
+                    continue
+                self.health.mark(m, False)
+                return resp, m
+        raise GeminiError(f"Gemini is temporarily unavailable, please retry: {_safe_error(last)}") from last
+
+    def _one_call(self, client, model: str, contents: str, cfg):
+        try:
+            return client.models.generate_content(model=model, contents=contents, config=cfg)
+        except Exception as e:
+            if cfg.thinking_config is not None and "think" in str(e).lower() and not _is_transient(e):
+                self._no_thinking.add(model)
+                return client.models.generate_content(
+                    model=model, contents=contents, config=cfg.model_copy(update={"thinking_config": None}))
+            raise
+
     def _call_with_retry(self, client, model: str, contents: str, config, timeout: int | None = None):
         """Retry transient overload errors with backoff; in auto mode fall back to the next model."""
         candidates = [model]
@@ -153,6 +230,7 @@ class GeminiClient:
             except GeminiError:
                 available = set()
             candidates += [m for m in PREFERRED_MODELS if m != model and m in available][:2]
+        candidates = self.health.order(candidates)
         last: Exception | None = None
         # Fast bounded backoff for interactive requests:
         delays = (0, 1, 3) if (timeout and timeout <= 30) else (0, 2, 6)
@@ -161,12 +239,29 @@ class GeminiClient:
                 if delay:
                     log.warning("Gemini transient error on %s; retrying in %ss", m, delay)
                     time.sleep(delay)
+                cfg = config
+                if m in self._no_thinking and getattr(config, "thinking_config", None) is not None:
+                    cfg = config.model_copy(update={"thinking_config": None})
                 try:
-                    return client.models.generate_content(model=m, contents=contents, config=config), m
+                    resp = client.models.generate_content(model=m, contents=contents, config=cfg)
+                    self.health.mark(m, False)
+                    return resp, m
                 except Exception as e:  # noqa: BLE001
                     last = e
+                    if cfg.thinking_config is not None and "think" in str(e).lower() and not _is_transient(e):
+                        # This model takes no thinking setting: ask again without one.
+                        self._no_thinking.add(m)
+                        try:
+                            resp = client.models.generate_content(
+                                model=m, contents=contents, config=config.model_copy(update={"thinking_config": None}))
+                            return resp, m
+                        except Exception as e2:  # noqa: BLE001
+                            last = e = e2
+                    if _is_quota(e):
+                        break  # this model's quota is used up; the next model has its own
                     if not _is_transient(e):
                         raise GeminiError(f"Gemini request failed: {_safe_error(e)}") from e
+            self.health.mark(m, True)
         raise GeminiError(f"Gemini is temporarily unavailable, please retry: {_safe_error(last)}") from last
 
 
@@ -176,6 +271,11 @@ def _is_transient(e: Exception) -> bool:
         return True
     text = str(e).upper()
     return any(t in text for t in ("503", "UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL", "TIMED OUT"))
+
+
+def _is_quota(e: Exception) -> bool:
+    code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    return code == 429 or "RESOURCE_EXHAUSTED" in str(e).upper()
 
 
 def _strip_fences(text: str) -> str:

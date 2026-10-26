@@ -784,3 +784,44 @@ def test_whatsapp_replies_can_go_through_a_content_template(settings, monkeypatc
     assert "body" not in sent[0] and sent[0]["content_sid"] == "HX" + "a" * 32
     assert json.loads(sent[0]["content_variables"]) == {"1": "Genesis: ready!\nhttps://x/download/abc"}
     assert sent[1]["body"] == "plain sms" and "content_sid" not in sent[1]
+
+
+# ---------- referrals ----------
+def test_invite_code_signs_up_friend_and_rewards_referrer(env):
+    env.text(OWNER, "INVITE")
+    code = env.store.referral_code(env.user(OWNER)["id"])
+    assert f"JOIN {code}" in env.last(OWNER)
+    env.text(STRANGER, f"join {code.lower()}")
+    friend = env.user(STRANGER)
+    assert friend["role"] == "guest" and friend["referred_by"] == env.user(OWNER)["id"]
+    assert "Welcome to Weave" in env.last(STRANGER)
+    assert "extra builds" in env.last(OWNER)
+    assert env.user(OWNER)["bonus_builds"] == env.settings.sms_referral_bonus
+    env.text(STRANGER, f"JOIN {code}")
+    assert "already linked" in env.last(STRANGER)
+
+
+def test_referral_code_counts_as_link_failure_when_wrong_and_respects_limits(env):
+    env.text(OWNER, "INVITE")
+    code = env.store.referral_code(env.user(OWNER)["id"])
+    env.settings.sms_referral_max = 1
+    env.text(STRANGER, f"JOIN {code}")
+    other = "+919876500077"
+    env.text(other, f"JOIN {code}")
+    assert env.user(other) is None  # out of invites
+    env.settings.sms_referrals = False
+    env.settings.sms_referral_max = 20
+    env.text("+919876500078", f"JOIN {code}")
+    assert env.user("+919876500078") is None
+
+
+def test_bonus_builds_raise_daily_limit(env):
+    env.text(OWNER, "INVITE")
+    code = env.store.referral_code(env.user(OWNER)["id"])
+    env.text(STRANGER, f"JOIN {code}")
+    friend = env.user(STRANGER)
+    env.settings.sms_daily_builds_guest = 0
+    env.store.update_user(friend["id"], bonus_builds=1)
+    assert env.sms.service._gate(env.store.user_by_id(friend["id"])) is None
+    env.store.update_user(friend["id"], bonus_builds=0)
+    assert env.sms.service._gate(env.store.user_by_id(friend["id"])) == "quota"

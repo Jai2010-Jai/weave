@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
@@ -26,7 +26,7 @@ from .core.antigravity import make_ai_client
 from .core.jobs import JOB_ID_RE, Orchestrator, QueueFullError, public_job
 from .core.schemas import BuildRequest
 from .sms.routes import PREVIEW_CSP
-from .web.hosting import hosted_file, label_for_host
+from .web.hosting import hosted_file, label_for_host, user_file, user_index_html
 
 log = logging.getLogger("genesis.server")
 STATIC = Path(__file__).parent / "static"
@@ -95,12 +95,18 @@ def create_app(settings: Settings | None = None, orchestrator: Orchestrator | No
         if s.chat_brain and hasattr(orch.gen, "ask"):
             from .sms.brain import ChatBrain
             sms_service.brain = ChatBrain(s, orch.gen, website_problem=sms_service.website_problem)
+        if hasattr(orch.gen, "ask"):
+            # Importing the Gemini SDK takes ~3 s: do it now, not while the first person waits for a reply.
+            threading.Thread(target=lambda: __import__("google.genai.types"), name="warm-genai", daemon=True).start()
+            from .sms.translate import Translator
+            sms_service.translator = Translator(s, orch.gen, sms_store)
         if getattr(s, "nlg_enabled", True):
             from .sms.nlg import NlgPresenter
             nlg_presenter = NlgPresenter(s, orch.gen if hasattr(orch.gen, "_structured") else None)
             sms_service.nlg = nlg_presenter
             sms.nlg = nlg_presenter
-        public_prefixes: tuple[str, ...] = PUBLIC_PREFIXES
+        from .site.routes import PUBLIC_PREFIXES as SITE_PREFIXES
+        public_prefixes: tuple[str, ...] = PUBLIC_PREFIXES + SITE_PREFIXES
     else:
         public_prefixes = ()
     # The worker also serves the web chat, so it runs whenever messaging isn't switched off.
@@ -133,18 +139,14 @@ def create_app(settings: Settings | None = None, orchestrator: Orchestrator | No
             # A customer site on <name>.<sites_domain>: public, read-only, sandboxed. Never reaches the API.
             if request.method not in ("GET", "HEAD"):
                 return PlainTextResponse("Method not allowed", status_code=405)
-            f = hosted_file(s.hosted_dir, hosted, request.url.path)
-            if f is None:
-                return PlainTextResponse("This site doesn't exist (yet). Made with Weave.", status_code=404)
-            return FileResponse(f, media_type="text/html; charset=utf-8", headers={
-                "Content-Security-Policy": PREVIEW_CSP, "Cache-Control": "public, max-age=60",
-                "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
-                "Cross-Origin-Opener-Policy": "same-origin"})
+            return serve_hosted(hosted, request.url.path)
         if request.method == "GET" and request.url.path == "/get":
             # The phone client APK holds no secrets; anyone on the network may download it.
             return await call_next(request)
         proxied = any(h in request.headers for h in PROXY_HEADERS)
         local = client_ip in LOOPBACK_CLIENTS and host in LOCAL_HOSTS and not proxied
+        if sms is not None and request.method == "GET" and request.url.path == "/" and not local:
+            return RedirectResponse("/start", status_code=303)  # the public front door is the sign-up page
         if public_prefixes and request.url.path.startswith(public_prefixes):
             # Twilio webhooks verify X-Twilio-Signature, downloads an expiring token, the chat a session cookie.
             # None of them use the access code.
@@ -183,6 +185,38 @@ def create_app(settings: Settings | None = None, orchestrator: Orchestrator | No
         if request.url.path == "/" or request.url.path.startswith("/static/"):
             resp.headers["Cache-Control"] = "no-cache"
         return resp
+
+    site_headers = {"Cache-Control": "public, max-age=60", "X-Content-Type-Options": "nosniff",
+                    "Referrer-Policy": "no-referrer", "Cross-Origin-Opener-Policy": "same-origin"}
+    missing = "This site doesn't exist (yet). Made with Weave."
+
+    def serve_hosted(label: str, path: str):
+        """<label>.<sites_domain>: an account's projects (/<project>/...) or, for numbers without an account, one
+        site at the root. Public, read-only and sandboxed; it never reaches the API."""
+        account = sms.store.account_by("username", label) if sms is not None else None
+        if account is None:
+            f = hosted_file(s.hosted_dir, label, path)
+            if f is None:
+                return PlainTextResponse(missing, status_code=404)
+            return FileResponse(f, media_type="text/html; charset=utf-8",
+                                headers={**site_headers, "Content-Security-Policy": PREVIEW_CSP})
+        if account["status"] != "active":  # suspended (taken down) or deleted
+            return PlainTextResponse("This site is unavailable.", status_code=404 if account["status"] == "deleted" else 451)
+        kind, value = user_file(s.user_sites_dir / label, path)
+        if kind == "redirect":
+            return RedirectResponse(value, status_code=308)
+        if kind == "file":
+            return FileResponse(value, media_type="text/html; charset=utf-8",
+                                headers={**site_headers, "Content-Security-Policy": PREVIEW_CSP})
+        if kind == "index":
+            user = sms.store.account_user(account["id"])
+            projects = [(p.get("name") or p["slug"], p["slug"]) for p in sms.store.account_projects(user["id"])
+                        if p.get("slug") and p.get("deploy_url")] if user else []
+            report = f"{s.public_base_url}/report" if s.public_base_url else ""
+            return HTMLResponse(user_index_html(label, projects, report), headers={
+                **site_headers, "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
+                                                           "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"})
+        return PlainTextResponse(missing, status_code=404)
 
     def get_job(job_id: str) -> dict:
         if not JOB_ID_RE.fullmatch(job_id):
@@ -300,6 +334,8 @@ def create_app(settings: Settings | None = None, orchestrator: Orchestrator | No
         app.include_router(build_router(s, sms.store, sms.service, sms.provider, orch.store, sms.voice,
                                         websites=sms.service.web))
         app.include_router(build_chat_router(s, sms.store, sms.service, orch.store))
+        from .site.routes import build_site_router
+        app.include_router(build_site_router(s, sms.store, sms.service, orch.store))
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     app.state.orchestrator = orch

@@ -2,6 +2,7 @@
 Gemini, Gradle, the weave bridge and Netlify are faked (see test_website.py for the real bridge contract)."""
 
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -392,14 +393,14 @@ def test_brain_cannot_start_a_build_from_a_greeting(u):
 
 def test_brain_new_website_and_context_lists_kinds(u):
     with_brain(u, ChatDecision(reply="On it!", action="new_website", spec="A premium website for Brew Haven coffee"))
-    u.text(OWNER, "Create a premium website for my coffee brand")
+    u.text(OWNER, "so I run a coffee brand and honestly a premium website would help a lot")
     assert u.projects()[0]["kind"] == "website"
     assert "new_website" in u.ai.systems[0] and "Website builder: available" in u.ai.contexts[0]
 
 
 def test_brain_disagreeing_with_user_words_asks(u):
     with_brain(u, ChatDecision(reply="Building your app", action="new_app", spec="Coffee brand landing"))
-    u.text(OWNER, "Create a premium website for my coffee brand")
+    u.text(OWNER, "so I run a coffee brand and honestly a premium website would help a lot")
     assert u.jobs() == [] and "Reply \"app\" or \"website\"" in u.last()
 
 
@@ -414,7 +415,7 @@ def test_brain_publish_action_only_asks(pub):
 def test_brain_told_websites_unavailable(settings, tmp_path):
     e = with_brain(UEnv(settings, tmp_path, websites=False),
                    ChatDecision(reply="Sure!", action="new_website", spec="A website for my coffee brand"))
-    e.text(OWNER, "Create a premium website for my coffee brand")
+    e.text(OWNER, "so I run a coffee brand and honestly a premium website would help a lot")
     assert "Never use new_website" in e.ai.systems[0]
     assert e.jobs() == [] and "can't make websites" in e.last()
 
@@ -492,7 +493,7 @@ def test_slow_ai_falls_back_to_rules(u):
     u.settings.chat_timeout = 1
     u.ai = SlowAI(5)
     u.sms.service.brain = ChatBrain(u.settings, u.ai, synchronous=True, website_problem=u.sms.service.website_problem)
-    u.text(OWNER, "Create a premium website for my coffee brand")
+    u.text(OWNER, "so I run a coffee brand and honestly a premium website would help a lot")
     assert u.ai.calls == 1
     assert u.projects()[0]["kind"] == "website" and "designing your website" in u.last()
 
@@ -560,10 +561,10 @@ def test_casual_greetings_are_greetings(u, text):
     assert (u.last().startswith("Hey!") or u.last().startswith("Genesis: Hey!")) and u.jobs() == []
 
 
-def test_greetings_go_to_the_ai_for_a_natural_reply(u):
+def test_greetings_are_answered_instantly_without_the_ai(u):
     with_brain(u, ChatDecision(reply="Yo! Not much, just here to build stuff. Got an idea?"))
     u.text(OWNER, "yo hi")
-    assert u.last() in ("Yo! Not much, just here to build stuff. Got an idea?", "Genesis: Yo! Not much, just here to build stuff. Got an idea?") and u.jobs() == []
+    assert "I'm Weave" in u.last() and u.jobs() == []  # fixed reply: never waits on an overloaded AI
 
 
 # ---------- Weave hosting (<name>.<sites_domain>) ----------
@@ -605,8 +606,8 @@ def test_hosted_sites_never_reach_the_api_or_other_files(hosted):
         assert hosted.client.get(path, headers=h).status_code == 404, path
     assert hosted.client.post("/api/builds", headers=h, json={}).status_code == 405
     assert hosted.client.get("/", headers={"host": "nope.weave.xyz"}).status_code == 404
-    assert hosted.client.get("/", headers={"host": "www.weave.xyz"}).status_code != 200
-    assert hosted.client.get("/", headers={"host": "a.b.weave.xyz"}).status_code != 200
+    assert hosted.client.get("/", headers={"host": "www.weave.xyz"}, follow_redirects=False).status_code != 200
+    assert hosted.client.get("/", headers={"host": "a.b.weave.xyz"}, follow_redirects=False).status_code != 200
 
 
 def test_same_brand_names_get_different_subdomains(tmp_path):
@@ -622,3 +623,104 @@ def test_same_brand_names_get_different_subdomains(tmp_path):
     assert first == "brew-haven" and second.startswith("brew-haven-") and second != first
     assert site_label(root, "WWW") != "www" and site_label(root, "!!") .startswith("site")
 
+
+# ---------- style question before a new website ----------
+def test_website_asks_style_then_builds_with_the_answer(u):
+    u.settings.website_ask_style = True
+    u.text(OWNER, "Create a premium website for my coffee brand")
+    assert "Which style do you like?" in u.last() and u.jobs() == []
+    u.text(OWNER, "3, gold accents and a serif font")
+    jobs = u.jobs()
+    assert len(jobs) == 1 and "dark and premium, gold accents and a serif font" in jobs[0]["prompt"]
+    assert jobs[0]["prompt"].startswith("Create a premium website for my coffee brand")
+
+
+def test_style_question_can_be_skipped_or_cancelled(u):
+    u.settings.website_ask_style = True
+    u.text(OWNER, "Create a premium website for my coffee brand")
+    u.text(OWNER, "skip")
+    assert u.jobs()[0]["prompt"] == "Create a premium website for my coffee brand"
+    u.drain()
+    u.text(OWNER, "new website: a site for my yoga studio in Pune")
+    assert "Which style" in u.last()
+    u.text(OWNER, "never mind")  # bare CANCEL is an SMS opt-out keyword
+    assert len(u.jobs()) == 1 and "won't build" in u.last()
+
+
+def test_request_that_already_describes_the_look_is_not_asked(u):
+    u.settings.website_ask_style = True
+    u.text(OWNER, "Create a website for my coffee brand with a dark theme and gold colours")
+    assert len(u.jobs()) == 1 and "Which style" not in u.last()
+
+
+# ---------- build lanes ----------
+def test_build_lanes_keep_websites_and_android_apart(u):
+    store = u.store
+    a = store.create_user("+15550001111", "member", "sms")
+    b = store.create_user("+15550002222", "member", "sms")
+    web = store.create_project(a["id"], "a website for my bakery", "website")
+    app = store.create_project(b["id"], "a habit tracker app", "android")
+    for user, project in ((a, web), (b, app)):
+        store.enqueue_job(user_id=user["id"], project_id=project["id"], kind="new", prompt=project["original_prompt"],
+                          change_request=None, base_build_id=None, max_attempts=1, inbound_sid=None)
+    assert store.claim_job("w", 60, "android")["project_id"] == app["id"]
+    assert store.claim_job("w", 60, "android") is None
+    assert store.claim_job("w", 60, "website")["project_id"] == web["id"]
+
+
+def test_home_page_goes_live_before_the_extra_pages(settings, tmp_path):
+    settings.website_deploy = "weave"
+    settings.sites_domain = "weave.xyz"
+    holder = {}
+
+    def slow_engine(request):
+        out = Path(request["out_dir"])
+        (out / "index.html").write_text(PAGE.replace("<head>", "<head><title>Brew Haven</title>"), encoding="utf-8")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not (settings.hosted_dir / "brew-haven" / "index.html").exists():
+            time.sleep(0.1)
+        holder["live_early"] = (settings.hosted_dir / "brew-haven" / "index.html").exists()
+        holder["sent_early"] = list(env.all())
+        (out / "about.html").write_text(PAGE.replace("Brew Haven", "About us"), encoding="utf-8")
+        (out / "menu.html").write_text("<html><body><iframe src=x></iframe></body></html>", encoding="utf-8")
+        return ok(pages=[{"file": "index.html"}, {"file": "about.html"}, {"file": "menu.html"}])
+
+    env = UEnv(settings, tmp_path, results=[slow_engine])
+    env.text(OWNER, "Create a premium website for my coffee brand")
+    env.drain()
+    assert holder["live_early"] and any("home page is live: https://brew-haven.weave.xyz/" in m for m in holder["sent_early"])
+    assert "All pages of Brew Haven are up" in env.last()
+    assert not any("Researching" in m for m in env.all()[-2:])
+    files = sorted(p.name for p in (settings.hosted_dir / "brew-haven").iterdir())
+    assert files == ["about.html", "index.html"]  # the page that failed the checks was dropped, not the site
+
+
+def test_clear_website_requests_skip_the_ai(u):
+    with_brain(u, ChatDecision(reply="On it!", action="new_website", spec="unused"))
+    u.text(OWNER, "Fitness website")
+    assert len(u.ai.decisions) == 1 and u.projects()[0]["kind"] == "website"  # the AI was never asked
+
+
+def test_bare_website_asks_what_for_then_builds(u):
+    u.text(OWNER, "Website")
+    assert "What's the website for?" in u.last() and u.jobs() == []
+    u.text(OWNER, "my fitness coaching")
+    assert u.projects()[0]["kind"] == "website" and "fitness coaching website" in u.jobs()[0]["prompt"]
+
+
+def test_change_during_a_build_is_queued_and_applied_after(u):
+    u.text(OWNER, "Create a premium website for my coffee brand")
+    first = u.jobs()[0]
+    u.store.update_job(first["id"], status="running")
+    u.text(OWNER, "make the header darker")
+    assert "right after it finishes" in u.last()
+    u.text(OWNER, "and add a menu section")
+    assert "apply all your changes together" in u.last()
+    jobs = u.jobs()
+    assert len(jobs) == 2 and jobs[1]["base_build_id"] is None and "add a menu" in jobs[1]["change_request"]
+    u.store.update_job(first["id"], status="queued")
+    u.drain()
+    jobs = u.jobs()
+    assert [j["status"] for j in jobs] == ["succeeded", "succeeded"]
+    built_on = u.web.store.get(jobs[1]["build_id"]).get("base_job_id")
+    assert built_on == jobs[0]["build_id"]  # applied on top of the first build, not from scratch

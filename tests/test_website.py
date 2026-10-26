@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -92,7 +93,8 @@ def test_bridge_env_holds_only_the_gemini_key(web_settings):
     for secret in ("nfp_secret_token", web_settings.twilio_auth_token):
         assert secret not in joined
     assert set(env) == {"PATH", "HOME", "TMPDIR", "WEAVE_DATA_DIR", "AGY_BIN", "GEMINI_API_KEY", "GEMINI_MODEL",
-                        "GEMINI_FALLBACK_MODELS", "NODE_OPTIONS"}
+                        "GEMINI_FALLBACK_MODELS", "NODE_OPTIONS", "WEBSITE_DEADLINE_MS",
+                        "GENESIS_WEBSITE_THINKING", "GEMINI_HEALTH_FILE"}
 
 
 def test_engine_failure_fails_the_build(web_settings):
@@ -186,7 +188,10 @@ export class GeminiClient {
   async generateContent(prompt, system, config) {
     const mode = process.env.FAKE_MODE;
     if (mode === 'busy' && this.model === 'fake-model') throw new Error('Gemini API error (503): high demand');
+    if (mode === 'stall' && this.model === 'fake-model') await new Promise((r) => setTimeout(r, 8000));
     if (mode === 'down') throw new Error('Gemini API error (503): overloaded key=AIzaSyFAKEFAKEFAKEFAKEFAKEFAKE');
+    if (mode === 'nothink' && config?.thinkingConfig) throw new Error('Gemini API error (400): thinking_level is not supported');
+    if (mode === 'ok' && !config?.thinkingConfig) throw new Error('Gemini API error (400): expected a thinking setting');
     if (system.includes('Design Director') && mode === 'badjson') return { text: '{"topicAnalysis": {"brandName": "X",}', raw: {} };
     if (system.includes('Design Director') && !(config?.responseMimeType === 'application/json'
         && config?.responseJsonSchema?.properties?.inspirations?.minItems === 3)) return { text: 'not json', raw: {} };
@@ -197,7 +202,8 @@ export class GeminiClient {
     if (system.includes('matching page')) return { text: '```html\\n<!DOCTYPE html><html><body><nav><a href="index.html">Home</a><a href="about.html">About</a><a href="contact.html">Contact</a></nav>page</body></html>\\n```', raw: {} };
     if (mode === 'nohtml') return { text: 'Sorry, I cannot.', raw: {} };
     if (system.includes('critique')) return { text: mode === 'same' ? CURRENT : '<!DOCTYPE html><html><body>changed</body></html>', raw: {} };
-    return { text: '```html\\n<!DOCTYPE html><html><body>model page</body></html>\\n```', raw: { usageMetadata: { promptTokenCount: 5 } } };
+    const budget = system.includes('LENGTH BUDGET') ? ' budgeted' : '';
+    return { text: '```html\\n<!DOCTYPE html><html><body>model page' + budget + '</body></html>\\n```', raw: { usageMetadata: { promptTokenCount: 5 } } };
   }
   async generateViaAgy() { return { text: '<!DOCTYPE html><html><body>agy</body></html>' }; }
 }
@@ -249,7 +255,7 @@ def fake_engine(tmp_path):
 needs_node = pytest.mark.skipif(not shutil.which("node"), reason="Node.js is not installed")
 
 
-def run_bridge(settings, tmp_path, request, mode="ok", key="AIzaSyFAKEFAKEFAKEFAKEFAKEFAKE"):
+def run_bridge(settings, tmp_path, request, mode="ok", key="AIzaSyFAKEFAKEFAKEFAKEFAKEFAKE", extra_env=None):
     settings.node_bin = shutil.which("node")
     out = tmp_path / f"out-{mode}"
     out.mkdir(exist_ok=True)
@@ -257,7 +263,8 @@ def run_bridge(settings, tmp_path, request, mode="ok", key="AIzaSyFAKEFAKEFAKEFA
     sandbox.mkdir(exist_ok=True)
     env = {"PATH": f"{Path(settings.node_bin).parent}:/usr/bin:/bin", "HOME": str(sandbox), "GEMINI_API_KEY": key,
            "GEMINI_MODEL": "fake-model", "FAKE_MODE": mode, "WEAVE_DATA_DIR": str(sandbox),
-           "GENESIS_RESEARCH_RETRY_MS": "0", "GEMINI_FALLBACK_MODELS": os.environ.get("GEMINI_FALLBACK_MODELS", "")}
+           "GENESIS_RESEARCH_RETRY_MS": "0", "GEMINI_FALLBACK_MODELS": os.environ.get("GEMINI_FALLBACK_MODELS", ""),
+           **(extra_env or {})}
     log = tmp_path / "bridge.log"
     result = node_runner(settings)({**request, "out_dir": str(out)}, env, sandbox, 60, threading.Event(), log)
     return result, out
@@ -268,7 +275,7 @@ def test_bridge_generates_page_from_model(settings, tmp_path, fake_engine):
     result, out = run_bridge(settings, tmp_path, {"op": "generate", "engine_dir": str(fake_engine), "prompt": "coffee brand site"})
     assert result["ok"] is True, result
     assert result["brand_name"] == "Brew Haven" and result["research"] == "ai"
-    assert (out / "index.html").read_text() == "<!DOCTYPE html><html><body>model page</body></html>"
+    assert (out / "index.html").read_text() == "<!DOCTYPE html><html><body>model page budgeted</body></html>"
     assert [c["phase"] for c in result["calls"]] == ["research", "html-1"]
     assert result["calls"][1]["input_tokens"] == 5
 
@@ -413,3 +420,36 @@ def test_name_comes_from_page_title_when_research_fell_back(web_settings):
     assert result["app_name"] == "Ember & Oak" and result["research"] == "fallback"
     result = build(WebsiteBuilder(web_settings, runner=FakeRunner([ok(html=page)])))
     assert result["app_name"] == "Brew Haven"  # research succeeded: its brand name wins
+
+
+@needs_node
+def test_bridge_drops_thinking_setting_a_model_rejects(settings, tmp_path, fake_engine):
+    result, out = run_bridge(settings, tmp_path, {"op": "generate", "engine_dir": str(fake_engine), "prompt": "coffee"},
+                             mode="nothink")
+    assert result["ok"] is True, result
+    assert [c["ok"] for c in result["calls"] if c["phase"] == "research"] == [False, True]  # one 400, then without
+    assert [c["ok"] for c in result["calls"] if c["phase"] == "html-1"] == [True]  # remembered for the next call
+
+
+@needs_node
+def test_bridge_shares_model_health_between_builds(settings, tmp_path, fake_engine):
+    health = tmp_path / "gemini-health.json"
+    env = {"GEMINI_FALLBACK_MODELS": "backup-model", "GEMINI_HEALTH_FILE": str(health)}
+    req = {"op": "generate", "engine_dir": str(fake_engine), "prompt": "coffee"}
+    first, _ = run_bridge(settings, tmp_path, req, mode="busy", extra_env=env)
+    assert first["ok"] is True and "fake-model" in json.loads(health.read_text())
+    second, _ = run_bridge(settings, tmp_path, req, mode="busy", extra_env=env)
+    assert second["ok"] is True
+    assert [c["model"] for c in second["calls"]][:2] == ["backup-model", "backup-model"]  # busy model skipped
+
+
+@needs_node
+def test_bridge_hedges_a_stalled_model_onto_the_next_one(settings, tmp_path, fake_engine):
+    env = {"GEMINI_FALLBACK_MODELS": "backup-model", "GENESIS_HEDGE_MS": "200"}
+    req = {"op": "generate", "engine_dir": str(fake_engine), "prompt": "coffee"}
+    started = time.monotonic()
+    result, out = run_bridge(settings, tmp_path, req, mode="stall", extra_env=env)
+    assert result["ok"] is True and time.monotonic() - started < 6  # never waited out the 8 s stall
+    winners = [c for c in result["calls"] if c["ok"] and ":" not in c["phase"]]
+    assert {c["model"] for c in winners} == {"backup-model"}
+    assert "budgeted" in (out / "index.html").read_text()

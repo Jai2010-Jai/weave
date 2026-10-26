@@ -15,6 +15,7 @@ HELP = ("Just talk to me normally (text or voice note):\n"
         "- \"send the link\" to download\n"
         "- \"show my apps\" / \"switch to 2\"\n"
         "- \"cancel it\" or \"try again\"\n"
+        "- INVITE to get a code for friends\n"
         "Say \"new app: <idea>\" to start a separate app.")
 
 # Stage -> (progress key, text). Only "major" stages are sent with GENESIS_SMS_PROGRESS=major.
@@ -40,8 +41,10 @@ def ascii_safe(text: str) -> str:
     return "".join(ch for ch in text if ch == "\n" or 32 <= ord(ch) < 127)
 
 
-def fit(text: str, limit: int = MAX_CHARS) -> str:
-    text = ascii_safe(text).strip()
+def fit(text: str, limit: int = MAX_CHARS, unicode: bool = False) -> str:
+    """Trim a message to `limit`. Plain SMS is also made GSM-7 safe (ASCII); WhatsApp and the web chat keep every
+    character (Hindi, Telugu, Kannada and Tamil scripts, emoji), so pass unicode=True for those."""
+    text = (text if unicode else ascii_safe(text)).strip()
     return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
 
@@ -55,7 +58,8 @@ def duration(hours: int) -> str:
 def name_of(project: dict | None) -> str:
     if not project:
         return "your app"
-    name = ascii_safe(project.get("name") or "").strip().rstrip(".")
+    # Any script is fine here; plain SMS is made ASCII later, when the whole message is fitted.
+    name = "".join(ch for ch in project.get("name") or "" if ch.isprintable()).strip().rstrip(".")
     if name:
         return name
     if project.get("kind") == "website":

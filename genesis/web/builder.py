@@ -24,7 +24,7 @@ from typing import Callable
 from ..config import Settings
 from ..core.jobs import JobCancelled, JobStore, Listener, now_iso
 from ..core.schemas import BuildRequest
-from .validate import WebsiteValidationError, validate_site
+from .validate import WebsiteValidationError, validate_page, validate_site
 
 log = logging.getLogger("genesis.web")
 
@@ -126,7 +126,7 @@ class WebsiteBuilder:
         self.model_resolver = model_resolver
         self.runner = runner or node_runner(settings)
         self.store = store or JobStore(settings.sites_dir)
-        self._slots = threading.BoundedSemaphore(1)
+        self._slots = threading.BoundedSemaphore(settings.website_workers)
         self._cancel: dict[str, threading.Event] = {}
         self._listeners: dict[str, Listener] = {}
         self.store.mark_interrupted()
@@ -193,7 +193,12 @@ class WebsiteBuilder:
         return {"PATH": f"{node_dir}:/usr/bin:/bin", "HOME": str(sandbox), "TMPDIR": str(sandbox),
                 "WEAVE_DATA_DIR": str(sandbox / "weave"), "AGY_BIN": "/nonexistent/agy",
                 "GEMINI_API_KEY": self.s.gemini_api_key, "GEMINI_MODEL": self._model(),
-                "GEMINI_FALLBACK_MODELS": self.s.website_fallback_models, "NODE_OPTIONS": ""}
+                "GEMINI_FALLBACK_MODELS": self.s.website_fallback_models, "NODE_OPTIONS": "",
+                "GENESIS_WEBSITE_THINKING": self.s.website_thinking,
+                # Shared by every build: models overloaded in the last minutes are tried last.
+                "GEMINI_HEALTH_FILE": str(self.s.data_dir / "gemini-health.json"),
+                # Optional extra pages stop here, leaving time to validate and ship what is done.
+                "WEBSITE_DEADLINE_MS": str(int((time.time() + self.s.website_timeout * 0.8) * 1000))}
 
     def _model(self) -> str:
         if self.s.gemini_model and self.s.gemini_model != "auto":
@@ -228,12 +233,19 @@ class WebsiteBuilder:
             self._stage(job, "generating", "Researching a design direction and writing the website")
         self._log(job, f"== Website engine: {request['op']} (model {self._model()}) ==")
         started = time.monotonic()
+        engine_done = threading.Event()
+        if request["op"] == "generate" and request.get("extra_pages"):
+            # The home page is written minutes before the extra pages: tell the listener as soon as it exists so the
+            # customer gets a live link right away instead of waiting for every page.
+            threading.Thread(target=self._watch_home, args=(job, site, engine_done, cancel), daemon=True,
+                             name=f"web-home-{job['id'][:8]}").start()
         try:
             result = self.runner(request, self._env(sandbox), sandbox, self.s.website_timeout, cancel,
                                  self.store.log_path(job["id"]))
         except BridgeError as e:
             return self._fail(job, str(e))
         finally:
+            engine_done.set()
             shutil.rmtree(sandbox, ignore_errors=True)
         calls = result.get("calls") or []
         job["ai_calls"] = [{"kind": c.get("phase"), "model": c.get("model"), "ok": c.get("ok"),
@@ -248,6 +260,7 @@ class WebsiteBuilder:
         if result.get("research") == "fallback":
             self._log(job, "Note: design research used weave's built-in directions (the research AI call failed).")
         self._stage(job, "validating", "Checking the generated website")
+        self._drop_bad_extra_pages(job, site)
         try:
             files = validate_site(site)
         except WebsiteValidationError as e:
@@ -267,6 +280,41 @@ class WebsiteBuilder:
         self.store.save(job)
         self._log(job, "== SUCCESS: website generated locally (not published) ==")
         self._notify(job, "succeeded")
+
+    def _watch_home(self, job: dict, site: Path, engine_done: threading.Event, cancel: threading.Event) -> None:
+        index = site / "index.html"
+        while not engine_done.wait(1):
+            if cancel.is_set():
+                return
+            if index.is_file():
+                try:
+                    validate_page(index.read_text(encoding="utf-8"))
+                except (OSError, WebsiteValidationError):
+                    return  # the full build reports the problem
+                self._log(job, "Home page ready; extra pages still being written")
+                self._notify({**job, "home_page": index.as_posix()}, "home_ready")
+                return
+
+    def _drop_bad_extra_pages(self, job: dict, site: Path) -> None:
+        """An extra page (about.html, ...) that fails the checks is removed rather than failing the whole site;
+        links to it go to the home page instead. The home page and design options are never dropped."""
+        dropped = []
+        for f in sorted(site.glob("*.html")):
+            if f.name == "index.html" or f.name.startswith("option"):
+                continue
+            try:
+                validate_page(f.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, WebsiteValidationError) as e:
+                self._log(job, f"Dropped extra page {f.name}: {e}")
+                f.unlink(missing_ok=True)
+                dropped.append(f.name)
+        for f in site.glob("*.html") if dropped else []:
+            text = f.read_text(encoding="utf-8", errors="replace")
+            fixed = text
+            for name in dropped:
+                fixed = fixed.replace(f'href="{name}"', 'href="index.html"')
+            if fixed != text:
+                f.write_text(fixed, encoding="utf-8")
 
     # ---------- helpers ----------
     def _stage(self, job: dict, stage: str, message: str) -> None:

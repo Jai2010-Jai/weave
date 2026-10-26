@@ -109,10 +109,17 @@ _ACK = (r"(?:thanks?(?: you)?|thank u|thx|ty|tysm|cheers|ok(?:ay)?|kk?|cool|nice
 THANKS = _rx(rf"^{_ACK}(?:[\s,!.]+{_ACK})*{SMALL}$")
 HELP = _rx(r"^(?:help|menu|commands|options)\b", r"\bwhat can (?:you|u) do\b", r"\bhow (?:does|do) (?:this|it|you) work",
            r"\bhow (?:do|can) i use\b", r"^(?:what|who) are (?:you|u)\b")
-STATUS = _rx(r"\b(?:status|progress|update|eta)\b\??$", r"\bhow(?:'?s| is)\s+(?:it|my app|my site|my website|the build|that|everything)\s+going\b",
-             r"\b(?:is|are)\s+(?:it|my app|the app|the build)\s+(?:ready|done|finished|built)\b",
-             r"\bhow (?:long|much longer)\b", r"\bwhat(?:'?s| is) (?:happening|going on)\b", r"\bany (?:update|news)\b",
-             r"\bwhere(?:'s| is) my app\b", r"\bdone yet\b", r"\bready yet\b")
+STATUS = _rx(r"\b(?:status|progress|updates?|eta)\b\??$", r"\bhow(?:'?s| is)\s+(?:it|my app|my site|my website|the build|that|everything)\s+going\b",
+             r"\b(?:is|are)\s+(?:it|my app|the app|the build|my (?:web)?site|the (?:web)?site)\s+(?:ready|done|finished|built)\b",
+             r"\bhow (?:long|much longer)\b", r"\bwhat(?:'?s| is) (?:happening|going on)\b", r"\bany (?:updates?|news)\b",
+             r"\bwhere(?:'s| is) my app\b", r"\bdone yet\b", r"\bready yet\b",
+             r"^(?:are\s+|r\s+)?(?:u|you|it)\s+(?:done|finished|ready)\b",
+             r"^(?:respond|reply|answer)(?:\s+(?:me|pls|please|bro|brh|bruh|man))*[\s!?.]*$")
+# "don't make a new site, just update that": a change, even though it says "make a new site".
+NOT_NEW = _rx(r"\b(?:don'?t|dont|do not|not|no|without)\s+(?:make|making|create|creating|build|building|start)?\s*"
+              r"(?:a\s+|another\s+)?(?:new|another|separate)\b")
+SITE_WORDS = {"website", "site", "web", "page", "webpage", "landing", "online", "for", "my", "our", "a", "an", "the",
+              "it", "this", "that", "is", "ready", "done", "yet", "of", "your", "ur"}
 PROJECTS = _rx(r"\b(?:list|show|see|what are)\s+(?:me\s+)?(?:all\s+)?(?:my\s+)?(?:apps|projects)\b",
                r"^(?:my\s+)?(?:apps|projects)\??$", r"\bwhat apps\b", r"\bwhich apps\b")
 DOWNLOAD = _rx(r"\b(?:send|give|resend|share|get|need|want)\s+(?:me\s+)?(?:the\s+|a\s+|my\s+)?(?:new\s+)?"
@@ -159,8 +166,12 @@ def classify(text: str, *, has_projects: bool, has_active: bool, project_names: 
         number = _project_number(target, project_names or {})
         if number is not None:
             return Intent("switch", str(number))
+    if has_projects and NOT_NEW.search(t) and CHANGE.search(t):
+        return Intent("change", t)
     if NEW_APP.search(t) or NEW_SITE.search(t):
         return Intent("new", t)
+    if short_site_request(t):
+        return Intent("new", t)  # "Fitness website", "bakery site": enough to start (the style question follows)
     if QUESTION.search(t) and not (has_active and CHANGE.search(t) and REQUEST.search(t)):
         return Intent("question", t)
     if not has_projects:
@@ -204,6 +215,16 @@ def answer_reply(text: str) -> str | None:
     if NO.search(t):
         return "no"
     return None
+
+
+def short_site_request(text: str) -> bool:
+    """A few words naming what a website is for: "fitness website", "website for my bakery"."""
+    words = re.findall(r"[\w']+", text.lower())
+    if not 2 <= len(words) <= 6 or not re.search(r"\b(?:website|site|webpage|landing page)\b", text, re.I):
+        return False
+    if (QUESTION.search(text) and not REQUEST.search(text)) or CHANGE.search(text):
+        return False
+    return sum(1 for w in words if w not in FILLER and w not in SITE_WORDS) >= 1
 
 
 def substance(text: str) -> int:

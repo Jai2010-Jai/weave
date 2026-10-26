@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import socket
+import tempfile
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from ..config import Settings
 from ..core.jobs import Orchestrator
@@ -51,6 +54,7 @@ class SmsWorker:
         self.worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._recover_lock = threading.Lock()  # several job loops share one recovery pass
 
     def _get_voice(self):
         if self.voice is None:
@@ -72,8 +76,14 @@ class SmsWorker:
 
     # ---------- lifecycle ----------
     def start(self) -> None:
-        for name, target in (("sms-jobs", self._job_loop), ("sms-inbound", self._inbound_loop), ("sms-outbox", self._outbox_loop)):
-            t = threading.Thread(target=target, name=name, daemon=True)
+        # Separate lanes: a slow Android build never holds up websites, and websites run side by side.
+        loops = [("sms-inbound", self._inbound_loop, ()), ("sms-outbox", self._outbox_loop, ()),
+                 ("sms-housekeeping", self._housekeeping_loop, ())]
+        loops += [(f"sms-jobs-android-{i}", self._job_loop, ("android",)) for i in range(self.s.max_concurrent_builds)]
+        if self.websites is not None:
+            loops += [(f"sms-jobs-web-{i}", self._job_loop, ("website",)) for i in range(self.s.website_workers)]
+        for name, target, args in loops:
+            t = threading.Thread(target=target, args=args, name=name, daemon=True)
             t.start()
             self._threads.append(t)
         event("sms.worker_started", worker=self.worker_id, provider=self.provider.name)
@@ -83,10 +93,10 @@ class SmsWorker:
         for t in self._threads:
             t.join(timeout)
 
-    def _job_loop(self) -> None:
+    def _job_loop(self, lane: str | None = None) -> None:
         while not self._stop.is_set():
             try:
-                if not self.run_once():
+                if not self.run_once(lane):
                     self._stop.wait(2)
             except Exception:  # noqa: BLE001 - the loop must survive anything
                 event("sms.worker_error", logging.ERROR)
@@ -113,6 +123,24 @@ class SmsWorker:
                 logging.getLogger("genesis.sms").exception("sms inbound loop error")
                 self._stop.wait(3)
 
+    def _housekeeping_loop(self) -> None:
+        """Once a day: empty trash older than trash_days and back up the database."""
+        self._stop.wait(60)
+        while not self._stop.is_set():
+            try:
+                self.housekeeping()
+            except Exception:  # noqa: BLE001
+                logging.getLogger("genesis.sms").exception("housekeeping error")
+            self._stop.wait(86_400)
+
+    def housekeeping(self) -> dict:
+        from ..web.hosting import purge_trash
+
+        purged = purge_trash(self.s.trash_dir, self.s.trash_days)
+        backup = self.store.backup(self.s.data_dir / "backups", keep=7)
+        event("sms.housekeeping", purged=purged, backup=backup.name if backup else None)
+        return {"purged": purged, "backup": backup}
+
     # ---------- jobs ----------
     def recover(self) -> int:
         """Return jobs whose worker vanished (lease expired) to the queue, or fail them after max attempts."""
@@ -127,10 +155,14 @@ class SmsWorker:
             self._after_failure(job, "Interrupted: the Weave worker stopped during this build")
         return n
 
-    def run_once(self) -> bool:
+    def run_once(self, lane: str | None = None) -> bool:
         """Recover stale jobs, then run at most one queued job. Returns True if a job was run."""
-        self.recover()
-        job = self.store.claim_job(self.worker_id, JOB_LEASE_S)
+        if self._recover_lock.acquire(blocking=False):
+            try:
+                self.recover()
+            finally:
+                self._recover_lock.release()
+        job = self.store.claim_job(self.worker_id, JOB_LEASE_S, lane)
         if job is None:
             return False
         self._run(job)
@@ -156,9 +188,18 @@ class SmsWorker:
         if engine is None:
             self.store.update_job(job["id"], status="failed", error="Website builder unavailable: not set up")
             return self._notify(job, user, f"Sorry, {ref} can't run: website building isn't set up on this Weave server.")
+        base_id, change_request = job["base_build_id"], job["change_request"]
+        if job["kind"] == "change" and not base_id:
+            # Queued while an earlier build of this project ran: apply it to what that build made, or rebuild from
+            # the full description (which already includes the change) if it made nothing usable.
+            base_id = (project or {}).get("last_success_build_id")
+            if base_id and not self.service._build_ok(base_id, (project or {}).get("kind") or "android"):
+                base_id = None
+            if not base_id:
+                change_request = None
         try:
-            build = engine.create_job(BuildRequest(prompt=job["prompt"]), base_job_id=job["base_build_id"],
-                                      change_request=job["change_request"], source="sms")
+            build = engine.create_job(BuildRequest(prompt=job["prompt"]), base_job_id=base_id,
+                                      change_request=change_request, source="sms")
         except (KeyError, ValueError) as e:
             # The base version vanished: rebuild from the full project description instead.
             event("sms.base_missing", logging.WARNING, ref=ref, error=type(e).__name__)
@@ -181,6 +222,12 @@ class SmsWorker:
             done.set()
             hb.join(2)
 
+        calls = result.get("ai_calls") or []
+        tokens_in = sum(c.get("input_tokens") or 0 for c in calls if isinstance(c, dict))
+        tokens_out = sum(c.get("output_tokens") or 0 for c in calls if isinstance(c, dict))
+        if tokens_in or tokens_out:  # per-user Gemini usage (dashboard, cost tracking)
+            self.store.update_job(job["id"], tokens_in=job.get("tokens_in", 0) + tokens_in,
+                                  tokens_out=job.get("tokens_out", 0) + tokens_out)
         current = self.store.job(job["id"]) or job
         if current["lease_owner"] != self.worker_id or current["status"] != "running":
             # Our lease expired (e.g. the machine slept) and another loop already took this job over.
@@ -268,6 +315,9 @@ class SmsWorker:
                 logging.getLogger("genesis.sms").exception("weave hosting failed for %s", job["ref"])
                 live = None
                 event("sms.host_failed", logging.WARNING, ref=job["ref"], error=type(e).__name__)
+            if live and (self.store.job(job["id"]) or {}).get("last_progress_key") == "home_ready":
+                return self._notify(job, user, f"All pages of {M.name_of(project)} are up: {live}\n"
+                                               "Want changes? Just tell me, like \"make the top darker\".")
             if live:
                 text = (f"Your website {M.name_of(project)} is {verb} and live!\nOpen it here: {live}\n"
                         "Want changes? Just tell me, like \"make the top darker\".")
@@ -291,12 +341,35 @@ class SmsWorker:
             fallback_web = self.nlg.present("website_succeeded", {"project_name": M.name_of(project), "build_ref": job["ref"], "url": url}, fallback_web)
         self._notify(job, user, fallback_web)
 
-    def _host_on_weave(self, project: dict, build_id: str) -> str:
-        """Publish one website version to https://<name>.<sites_domain>/ and record it on the project."""
-        from ..web.hosting import publish_hosted, site_label, site_url
+    def _host_on_weave(self, project: dict, build_id: str, site_dir: Path | None = None) -> str:
+        """Publish one website version and record it on the project: https://<username>.<sites_domain>/<slug>/ for
+        account holders, https://<name>.<sites_domain>/ for numbers without an account (owners, older users)."""
+        from ..web.hosting import (dir_size, project_slug, project_url, publish_hosted, publish_project, site_label,
+                                   site_url)
+        from ..web.validate import public_problem
 
+        site_dir = site_dir or self.websites.site_dir(build_id)
+        if problem := public_problem(site_dir):
+            event("sms.host_refused", logging.WARNING, project=project["id"], reason=problem)
+            raise ValueError(f"not hosted publicly: {problem}")
+
+        account = self.store.account_for_user(project["user_id"])
+        if account is not None:
+            user_root = self.s.user_sites_dir / account["username"]
+            slug = project.get("slug") or project_slug(
+                project.get("name") or "", lambda x: self.store.slug_taken(project["user_id"], x, project["id"])
+                or (user_root / x).exists())
+            used = dir_size(user_root) - dir_size(user_root / slug) + dir_size(site_dir)
+            if used > self.s.user_storage_mb * 1_000_000:
+                raise ValueError(f"storage limit of {self.s.user_storage_mb} MB reached")
+            publish_project(user_root, site_dir, slug)
+            url = project_url(account["username"], slug, self.s.sites_domain)
+            self.store.update_project(project["id"], deploy_url=url, deploy_site_id=f"{account['username']}/{slug}",
+                                      slug=slug)
+            event("sms.hosted", site=f"{account['username']}/{slug}")
+            return url
         label = site_label(self.s.hosted_dir, project.get("name") or "", project.get("deploy_site_id"))
-        publish_hosted(self.s.hosted_dir, self.websites.site_dir(build_id), label)
+        publish_hosted(self.s.hosted_dir, site_dir, label)
         url = site_url(label, self.s.sites_domain)
         self.store.update_project(project["id"], deploy_url=url, deploy_site_id=label)
         event("sms.hosted", site=label)
@@ -337,6 +410,8 @@ class SmsWorker:
 
     def _progress(self, job_id: int, build: dict, ev: str) -> None:
         """Build listener: turn real stage changes into rate-limited SMS updates."""
+        if ev == "home_ready":
+            return self._home_ready(job_id, build)
         table = M.WEB_PROGRESS if build.get("kind") == "website" else M.PROGRESS
         if ev in ("succeeded", "failed") or self.s.sms_progress == "off" or ev not in table:
             return
@@ -352,18 +427,54 @@ class SmsWorker:
             key = f"building-{len(build['attempts']) + 1}"
             text = f"Rebuilding with the fix (attempt {len(build['attempts']) + 1})."
         now = time.time()
-        if key == job["last_progress_key"]:
-            return
+        if key == job["last_progress_key"] or job["last_progress_key"] == "home_ready":
+            return  # nothing to add once the home page link is out
         if ev != "repairing" and now - job["last_progress_at"] < self.s.sms_progress_min_interval:
             return
         self.store.update_job(job_id, last_progress_key=key, last_progress_at=now)
         self._notify(job, self.store.user_by_id(job["user_id"]), f"{job['ref']}: {text}")
 
+    def _home_ready(self, job_id: int, build: dict) -> None:
+        """A new website's home page exists while its other pages are still being written: put the home page live
+        now and send the link, so the customer isn't waiting on pages they haven't asked about yet."""
+        from ..web.builder import page_title
+
+        job = self.store.job(job_id)
+        if (job is None or job["cancel_requested"] or job["kind"] != "new" or self.s.website_deploy != "weave"
+                or not self.s.sites_domain or not build.get("home_page")):
+            return
+        project = self.store.project(job["user_id"], job["project_id"])
+        if project is None:
+            return
+        home = Path(build["home_page"])
+        if not project.get("name"):
+            # The site's address comes from its name and never changes, so without a real title the early link waits
+            # for the finished build (which knows the brand name).
+            if not (title := page_title(home).strip()[:30]):
+                return
+            self.store.update_project(project["id"], name=title)
+            project = self.store.project(job["user_id"], job["project_id"])
+        stage = Path(tempfile.mkdtemp(prefix="home-", dir=self.s.data_dir))
+        try:
+            shutil.copyfile(home, stage / "index.html")
+            url = self._host_on_weave(project, build["id"], site_dir=stage)
+        except (OSError, ValueError, RuntimeError) as e:
+            event("sms.home_host_failed", logging.WARNING, ref=job["ref"], error=type(e).__name__)
+            return
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        self.store.update_job(job_id, last_progress_key="home_ready", last_progress_at=time.time())
+        event("sms.home_live", ref=job["ref"])
+        self._notify(job, self.store.user_by_id(job["user_id"]),
+                     f"Your home page is live: {url}\nI'm adding the other pages now and will message you when "
+                     "they're up (usually a minute or two).")
+
     def _notify(self, job: dict, user: dict | None, text: str) -> None:
         if user is None or user["status"] != "active":
             return
-        self.store.enqueue_sms(address(user["phone"], user["channel"]), M.fit(text), user["id"], job["id"],
-                               user["reply_from"] if user["channel"] != "web" else None)
+        limit = M.MAX_CHARS if user["channel"] == "sms" else M.MAX_CHARS_CHAT
+        self.service.queue_text(address(user["phone"], user["channel"]), user["id"], text, limit, job["id"],
+                                user["reply_from"] if user["channel"] != "web" else None)
 
     # ---------- outbox ----------
     def send_outbox(self) -> int:

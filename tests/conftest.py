@@ -35,6 +35,7 @@ def settings(tmp_path: Path) -> Settings:
     s.ai_backend = "api"
     # Never use real Twilio credentials from .env in tests: outbound SMS go to a fake provider.
     s.sms_provider = "log"
+    s.website_ask_style = False  # tests that want the style question turn it on
     s.twilio_account_sid = "AC" + "0" * 32
     s.twilio_auth_token = "test-auth-token"
     s.twilio_phone_number = "+15005550006"

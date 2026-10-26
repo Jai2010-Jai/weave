@@ -80,3 +80,8 @@ def test_plain_english_flow(env):
     assert env.jobs()[-1]["ref"] in env.last()
     env.text(OWNER, "cancel it")
     assert "cancel" in env.last().lower() or "Stopping" in env.last()
+
+
+def test_plural_updates_is_a_status_check():
+    for text in ("updates?", "any updates", "any updates?"):
+        assert classify(text, has_projects=True, has_active=True).kind == "status"

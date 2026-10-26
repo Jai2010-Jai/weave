@@ -50,8 +50,13 @@ or website that needs one of these, don't stop to ask: build the closest version
 (new_app / new_website with that spec) and say in one short sentence what it can't do (e.g. "it works
 offline, so orders stay on your phone"). Only ask first when the idea itself is unclear.
 
-How to talk: like a helpful friend texting. Short (usually 1-3 sentences), warm, casual, in the same
-language and tone as the user. Plain text only (no markdown, no bullet lists unless they help).
+How to talk: like a helpful friend texting, not a menu. Short (usually 1-3 sentences), warm, casual, matching
+the user's tone. Answer what they actually said: small talk, jokes, questions about you, about themselves
+("what's my name?" - use "Their name" below), or anything else, then steer back to building only if it fits.
+Plain text only (no markdown, no bullet lists unless they help).
+Language: always reply in the language given under "Reply language" (Telugu, Kannada, Hindi, Tamil or English),
+in the script it says, even if the user mixes languages. Keep links, build IDs, numbers and command words
+(STATUS, HELP, LINK, STOP) exactly as they are. Write "spec" in English (the builders read English).
 Never prefix your replies with "Weave:" or "Genesis:".
 Never invent build IDs, links, progress or features that don't exist; the server sends those.
 
@@ -107,14 +112,25 @@ class ChatBrain:
         # Callable returning why websites can't be built ("" = they can). None = no website builder.
         self.website_problem = website_problem or (lambda: "the website builder isn't set up")
         self.synchronous = synchronous
-        # One at a time keeps each user's messages in order and doesn't flood the AI backend.
-        self._pool = None if synchronous else ThreadPoolExecutor(max_workers=1, thread_name_prefix="genesis-brain")
+        # Different people are answered at the same time; one person's messages are answered in order (a lock per
+        # person). A single shared worker made everyone queue behind each other's 10-second replies.
+        self._pool = None if synchronous else ThreadPoolExecutor(max_workers=getattr(settings, "chat_workers", 16),
+                                                                 thread_name_prefix="genesis-brain")
+        self._locks: dict = {}
+        self._locks_guard = threading.Lock()
 
-    def submit(self, fn) -> None:
+    def submit(self, fn, key=None) -> None:
         if self._pool is None:
             fn()
-        else:
-            self._pool.submit(fn)
+            return
+        with self._locks_guard:
+            lock = self._locks.setdefault(key, threading.Lock())
+
+        def run() -> None:
+            with lock:
+                fn()
+
+        self._pool.submit(run)
 
     def decide(self, context: str) -> ChatDecision:
         """Ask the AI, but never wait longer than GENESIS_CHAT_TIMEOUT_SECONDS: past that the caller answers with

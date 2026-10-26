@@ -17,12 +17,15 @@ from ..core.jobs import JobStore
 from . import messages as M
 from .observe import event
 from .phone import mask, normalize_e164
-from .intent import answer_kind, answer_reply, classify, other_kind_requested, substance, target_kind
+from .intent import (NEW_SITE, answer_kind, answer_reply, classify, other_kind_requested, short_site_request, substance,
+                     target_kind)
+from .language import CONFIRM, language_label, needs_translation, requested_language, script_language
 from .store import SmsStore
 
 MIN_PROMPT, MAX_PROMPT = 10, 4000
 LINK_MAX_FAILURES, LINK_LOCK_S = 5, 3600
 UNKNOWN_REPLY_EVERY_S = 86_400
+ONBOARD_REMINDER_S = 120
 # Twilio's default Advanced Opt-Out keywords (whole-message match). Twilio blocks further sends itself;
 # Genesis records the state and never replies. CANCEL is one of them, so builds are stopped with ABORT.
 OPT_OUT = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT", "OPTOUT", "REVOKE"}
@@ -35,10 +38,22 @@ NEW_INTENT = re.compile(
     r"(?:\w+\s+){0,5}?(?:app|application|tracker|calculator|planner|journal|timer|counter|game|manager|"
     r"organi[sz]er|flashcards?|quiz|to-?do list)\b"
     r"|\b(?:new|another|second|separate|different)\s+app\b", re.I)
+STYLES = {"1": "clean and minimal", "2": "bold and colourful", "3": "dark and premium", "4": "warm and cosy"}
+STYLE_QUESTION = ("Quick question before I design it. Which style do you like?\n"
+                  "1. Clean and minimal\n2. Bold and colourful\n3. Dark and premium\n4. Warm and cosy\n"
+                  "Reply with a number and anything else you want (colours, fonts, sites you like), "
+                  "e.g. \"3, gold accents\". Or say \"skip\" and I'll choose.")
+STYLE_SKIP = re.compile(r"^(skip|no|nah|nope|none|any|anything|whatever|idk|go|go ahead|just build( it)?|"
+                        r"you (choose|pick|decide)|surprise me|up to you|doesn'?t matter|no preference)[.! ]*$", re.I)
+STYLE_STOP = re.compile(r"^(cancel|stop|abort|never ?mind|forget it)[.! ]*$", re.I)
+# A request that already describes the look doesn't need the style question.
+STYLE_WORDS = re.compile(r"\b(colou?rs?|dark|light|minimal\w*|vintage|retro|pastel|neon|palette|fonts?|themes?|"
+                         r"aesthetic|style[ds]?|black|white|blue|red|green|pink|purple|gold(en)?|orange|yellow|beige|"
+                         r"brown|navy|teal|cream|monochrome|brutalist|glass\w*)\b", re.I)
 REF_RE = re.compile(r"^G-[2-9A-HJ-NP-TV-Z]{5}$", re.I)
 # Factual requests are answered from Genesis's own data right away; greetings and chat go to the AI so it can talk
 # naturally (with a light chat model that takes ~2 s), falling back to the rules if it's slow.
-INSTANT = {"help", "status", "projects", "download", "cancel"}
+INSTANT = {"greeting", "thanks", "help", "status", "projects", "download", "cancel"}
 NEVER_BUILDS = {"greeting", "thanks", "help", "status", "projects", "download", "cancel", "publish"}
 
 
@@ -62,6 +77,7 @@ class SmsService:
         self.brain = None  # ChatBrain when plain-language chat runs through the AI backend
         self.web = None  # genesis.web.builder.WebsiteBuilder; None = no website builder in this process
         self.nlg = None  # genesis.sms.nlg.NlgPresenter; presents verified facts naturally
+        self.translator = None  # genesis.sms.translate.Translator; puts messages into each person's language
         self.owners = {n for n in (normalize_e164(x, settings.sms_default_country_code) for x in settings.sms_owner_numbers) if n}
 
     def _present(self, kind: str, facts: dict, fallback: str, user_query: str = "") -> str:
@@ -133,6 +149,15 @@ class SmsService:
             event("sms.ignored", phone=mask(phone), status=user["status"])
             return "ignored"
         self.store.set_inbound_user(msg.sid, user["id"])
+        if word in ("LINK", "JOIN") and rest and " " not in rest.strip():
+            linked = self._link_account(phone, channel, rest, msg.sid, user)
+            if linked is not None:
+                return linked
+        if self.s.sms_signup == "account" and user["role"] != "owner" and not user.get("account_id"):
+            return self._onboard(phone, channel, body)
+        if user.get("account_id") and user["role"] != "owner" and self.store.account_for_user(user["id"]) is None:
+            event("sms.account_inactive", phone=mask(phone))
+            return "account_inactive"  # suspended after an abuse report, or deleted
         if body == "[voice note]":
             self._reply(phone, user, "I couldn't hear any audio with that voice note. Describe your app in words, or send a voice note.")
             return "voice_note"
@@ -149,17 +174,36 @@ class SmsService:
         info = self.store.unknown_sender(phone)
         reply_to = address(phone, channel)
         now = time.time()
-        if word == "LINK" and self.s.sms_signup in ("link", "open"):
+        if word in ("LINK", "JOIN") and rest and info["locked_until"] <= now:
+            linked = self._link_account(phone, channel, rest, sid)
+            if linked is not None:
+                return linked
+        if re.fullmatch(r"[A-Za-z0-9]{6}", body) and info["locked_until"] <= now:
+            # The dashboard code sent on its own, without LINK in front.
+            linked = self._link_account(phone, channel, body, sid)
+            if linked is not None:
+                return linked
+        if self.s.sms_signup == "account" and not (word in ("LINK", "JOIN") and rest):
+            return self._onboard(phone, channel, body)
+        if word in ("LINK", "JOIN") and self.s.sms_signup in ("link", "open", "account"):
             if info["locked_until"] > now:
                 event("sms.link_locked", logging.WARNING, phone=mask(phone))
                 return "link_locked"
             user = self.store.consume_link_code(rest, phone, channel)
+            if user is None and self.s.sms_referrals and self.s.sms_signup != "account":
+                referred = self.store.consume_referral_code(rest, phone, channel, "guest", self.s.sms_referral_bonus,
+                                                            self.s.sms_referral_max)
+                if referred is not None:
+                    self.store.update_unknown_sender(phone, link_failures=0, locked_until=0)
+                    return self._referred(referred[0], referred[1], sid)
             if user is None:
                 failures = info["link_failures"] + 1
                 self.store.update_unknown_sender(phone, link_failures=failures,
                                                  locked_until=now + LINK_LOCK_S if failures >= LINK_MAX_FAILURES else 0)
                 event("sms.link_failed", logging.WARNING, phone=mask(phone), failures=failures)
-                fallback = "That link code is invalid or expired. Ask the Weave owner for a new one."
+                fallback = ("That code is invalid or expired. Get a new one from your Weave dashboard: "
+                            f"{self.s.public_base_url}/dashboard" if self.s.sms_signup == "account" else
+                            "That link code is invalid or expired. Ask the Weave owner for a new one.")
                 self._send(reply_to, None, self._present("link_failed", {"action": "link"}, fallback, user_query=f"{word} {rest}"))
                 return "link_failed"
             self.store.update_unknown_sender(phone, link_failures=0, locked_until=0)
@@ -182,16 +226,233 @@ class SmsService:
         event("sms.unauthorized", logging.WARNING, phone=mask(phone))
         if now - info["last_reply_at"] > UNKNOWN_REPLY_EVERY_S:
             self.store.update_unknown_sender(phone, last_reply_at=now)
-            text = ("This number isn't linked to Weave yet. Ask the owner for a link code, then text LINK <code>."
+            text = ("This number isn't linked to Weave yet. Ask the owner for a link code (or a friend for an invite code), then text LINK <code>."
                     if self.s.sms_signup == "link" else "This number isn't authorized to use Weave.")
             self._send(reply_to, None, self._present("unauthorized", {"signup": self.s.sms_signup}, text, user_query=body))
         return "unauthorized"
 
+    def _referred(self, user: dict, referrer: dict, sid: str) -> str:
+        self.store.set_inbound_user(sid, user["id"])
+        user = self._remember_reply_from(user)
+        event("sms.user_referred", phone=mask(user["phone"]), referrer=mask(referrer["phone"]))
+        self._reply(user["phone"], user, "Welcome to Weave! You joined with a friend's invite. Describe an app or "
+                    "website and I'll build it. Text INVITE to get your own code.")
+        if self.s.sms_referral_bonus:
+            self._reply(referrer["phone"], referrer, f"A friend just joined Weave with your invite code. You earned "
+                        f"{self.s.sms_referral_bonus} extra builds per day.")
+        return "referred"
+
+    def _onboard(self, phone: str, channel: str, body: str) -> str:
+        """Account mode: numbers without a Weave account get the sign-up link (at most once a day)."""
+        info = self.store.unknown_sender(phone)
+        now = time.time()
+        event("sms.onboarding", phone=mask(phone))
+        if now - info["last_reply_at"] > UNKNOWN_REPLY_EVERY_S or body.upper() in ("HI", "HELLO", "HEY", "START", "HELP"):
+            self.store.update_unknown_sender(phone, last_reply_at=now)
+            self._send(address(phone, channel), None,
+                       f"Hi! I'm Weave. I build apps and websites from a text. To start, create your free account "
+                       f"(takes a minute): {self.s.public_base_url}/start\nThen text me the code it gives you.")
+        elif now - info["last_reply_at"] > ONBOARD_REMINDER_S:
+            # Never leave someone talking to silence; a short nudge at most every couple of minutes.
+            self.store.update_unknown_sender(phone, last_reply_at=now)
+            self._send(address(phone, channel), None,
+                       f"I'm here! Finish signing up at {self.s.public_base_url}/start, then send me the 6-letter "
+                       "code from your dashboard.")
+        return "onboarding"
+
+    def _link_account(self, phone: str, channel: str, rest: str, sid: str, user: dict | None = None) -> str | None:
+        """LINK <code> with a code from the dashboard: proves this number belongs to the account. None if the code
+        isn't a phone code (it may still be an owner link code or an invite code)."""
+        outcome, linked, account = self.store.link_phone(rest, phone, channel)
+        if outcome == "invalid":
+            return None
+        if outcome == "taken":
+            event("sms.link_taken", logging.WARNING, phone=mask(phone))
+            self._send(address(phone, channel), None, "This number is already linked to a different Weave account. "
+                       "Use the number already on your account, or sign in to that account instead.")
+            return "link_taken"
+        self.store.update_unknown_sender(phone, link_failures=0, locked_until=0)
+        self.store.set_inbound_user(sid, linked["id"])
+        linked = self._remember_reply_from(linked)
+        event("sms.account_linked", outcome=outcome, phone=mask(phone), account=account["id"])
+        name = account.get("call_sign") or account["username"]
+        if outcome == "relinked":
+            text = f"Done, {name}. Weave now uses this number for your account. Your projects came with you."
+        else:
+            text = (f"You're in, {name}! Your Weave address is {account['username']}.{self.s.sites_domain or 'askweave.xyz'}"
+                    f"\nDescribe an app or website and I'll build it, like \"a website for my bakery\". Text HELP for commands.")
+            if outcome == "created" and account.get("referral_code") and self.s.sms_referrals:
+                referrer = self.store.credit_referral(linked["id"], account["referral_code"], self.s.sms_referral_bonus,
+                                                      self.s.sms_referral_max)
+                if referrer is not None and self.s.sms_referral_bonus:
+                    self._reply(referrer["phone"], referrer, f"A friend just joined Weave with your invite code. You earned "
+                                f"{self.s.sms_referral_bonus} extra builds per day.")
+        self._reply(phone, linked, text)
+        return "account_" + outcome
+
+    def _call_sign(self, user: dict) -> str:
+        account = self.store.account_for_user(user["id"]) if user.get("account_id") else None
+        return (account.get("call_sign") or "") if account else ""
+
+    def _rename_me(self, user: dict, raw: str) -> str:
+        from ..site.names import clean_call_sign
+
+        account = self.store.account_for_user(user["id"]) if user.get("account_id") else None
+        if account is None:
+            self._reply(user["phone"], user, f"Create a Weave account to set your name: {self.s.public_base_url}/start")
+            return "call_sign_none"
+        name = clean_call_sign(raw.strip().strip(".!\"'"))
+        if not name:
+            self._reply(user["phone"], user, "I can't use that name. Try something shorter, without links.")
+            return "call_sign_bad"
+        self.store.update_account(account["id"], call_sign=name)
+        self._reply(user["phone"], user, f"Got it, I'll call you {name}.")
+        return "call_sign"
+
+    def _moderate(self, user: dict, word: str, target: str) -> str:
+        """Owner-only abuse handling: REPORTS lists open reports; TAKEDOWN <username>[/<project>] takes a whole
+        account's sites (suspends it) or one project offline; REINSTATE <username> lifts a suspension."""
+        if word == "REPORTS":
+            items = self.store.reports()[:10]
+            lines = [f"#{r['id']} {r['reason']}: {r['site']}" for r in items] or ["No open reports."]
+            self._reply(user["phone"], user, "\n".join(lines))
+            return "reports"
+        username, _, slug = target.partition("/")
+        account = self.store.account_by("username", username) if username else None
+        if account is None:
+            self._reply(user["phone"], user, f"No account called {username or '(none)'}. Use TAKEDOWN <username>[/<project>].")
+            return "moderate_none"
+        if word == "REINSTATE":
+            self.store.update_account(account["id"], status="active")
+            self._reply(user["phone"], user, f"{username} is reinstated.")
+            return "reinstated"
+        member = self.store.account_user(account["id"])
+        if slug:
+            project = self.store.project_by_slug(member["id"], slug) if member else None
+            if project is None:
+                self._reply(user["phone"], user, f"{username} has no live project at /{slug}/.")
+                return "moderate_none"
+            self.delete_project(member, project)
+            self._reply(user["phone"], user, f"Took down {username}/{slug}.")
+        else:
+            self.store.update_account(account["id"], status="suspended")
+            self.store.delete_account_sessions(account_id=account["id"])
+            self._reply(user["phone"], user, f"Suspended {username}: all their sites are offline and they can't sign in. "
+                        f"REINSTATE {username} to undo.")
+        for r in self.store.reports():
+            if f"{username}." in r["site"]:
+                self.store.close_report(r["id"], "actioned")
+        event("sms.takedown", target=target)
+        return "takedown"
+
+    def _delete_request(self, user: dict, project: dict | None) -> str:
+        if project is None:
+            return self._clarify(user, "Which project should I delete? Say DELETE and its number.")
+        self.store.update_user(user["id"], pending_text=str(project["id"]), pending_question="delete")
+        where = " Its website goes offline." if project.get("deploy_url") else ""
+        self._reply(user["phone"], user, f"Delete {project['number']} {M.name_of(project)}?{where} You can restore it from "
+                    f"your dashboard for {self.s.trash_days} days. Reply YES to delete, or anything else to keep it.")
+        return "delete_confirm"
+
+    def _resolve_delete(self, user: dict, body: str) -> str | None:
+        project_id = int(user["pending_text"]) if str(user["pending_text"]).isdigit() else None
+        self.store.update_user(user["id"], pending_text=None, pending_question=None)
+        if not re.fullmatch(r"(yes|y|yeah|yep|confirm|delete( it)?|do it)[.! ]*", body.strip(), re.I):
+            if re.fullmatch(r"(no|n|nope|nah|keep( it)?|cancel|never ?mind|stop)[.! ]*", body.strip(), re.I):
+                self._reply(user["phone"], user, "Okay, I kept it.")
+                return "delete_kept"
+            return None  # something else entirely: handle it normally
+        project = self.store.project(user["id"], project_id)
+        if project is None or project.get("deleted_at"):
+            self._reply(user["phone"], user, "That project is already gone.")
+            return "delete_none"
+        self.delete_project(user, project)
+        self._reply(user["phone"], user, f"Deleted {M.name_of(project)}. Restore it from your dashboard within "
+                    f"{self.s.trash_days} days if you change your mind.")
+        return "deleted"
+
+    def delete_project(self, user: dict, project: dict) -> None:
+        """Soft delete: the project leaves every list and its site goes offline into the trash, restorable for
+        trash_days days. A running build for it is cancelled."""
+        from ..web.hosting import move_to_trash
+
+        job = self.store.active_job(user["id"])
+        if job and job["project_id"] == project["id"]:
+            self.store.request_cancel(job["id"])
+        trash_name = None
+        account = self.store.account_for_user(user["id"]) if user.get("account_id") else None
+        if account and project.get("slug"):
+            trash_name = move_to_trash(self.s.user_sites_dir / account["username"], self.s.trash_dir,
+                                       account["username"], project["slug"])
+        self.store.update_project(project["id"], deleted_at=time.time(), trash_name=trash_name)
+        if user.get("active_project_id") == project["id"]:
+            self.store.update_user(user["id"], active_project_id=None)
+        event("sms.project_deleted", phone=mask(user["phone"]), project=project["id"])
+
+    def restore_project(self, user: dict, project: dict) -> bool:
+        from ..web.hosting import restore_from_trash
+
+        account = self.store.account_for_user(user["id"]) if user.get("account_id") else None
+        if not project.get("deleted_at"):
+            return False
+        if account and project.get("trash_name") and project.get("slug"):
+            if not restore_from_trash(self.s.user_sites_dir / account["username"], self.s.trash_dir,
+                                      account["username"], project["trash_name"], project["slug"]):
+                return False
+        self.store.update_project(project["id"], deleted_at=None, trash_name=None)
+        event("sms.project_restored", phone=mask(user["phone"]), project=project["id"])
+        return True
+
+    def _invite(self, user: dict) -> str:
+        if not self.s.sms_referrals or self.s.sms_signup == "closed":
+            self._reply(user["phone"], user, "Invites aren't available right now.")
+            return "invite_off"
+        code = self.store.referral_code(user["id"])
+        left = max(0, self.s.sms_referral_max - self.store.referral_count(user["id"]))
+        text = (f"Your invite code: {code}\nFriends sign up at {self.s.public_base_url}/start and enter it."
+                if self.s.sms_signup == "account" else
+                f"Your invite code: {code}\nFriends text JOIN {code} to this number to start building.")
+        if self.s.sms_referral_bonus:
+            text += f" You get {self.s.sms_referral_bonus} extra builds per day for each friend who joins."
+        text += f" ({left} invites left)"
+        self._reply(user["phone"], user, text)
+        return "invite"
+
     # ---------- commands and plain English ----------
     def _dispatch(self, user: dict, word: str, rest: str, body: str, sid: str) -> str:
+        if (lang := requested_language(body)) is not None:
+            # "speak telugu", "hindi me baat karo": switch now, answered instantly in the new language.
+            code = None if lang == "en" else lang
+            self.store.update_user(user["id"], language=code)
+            event("sms.language", phone=mask(user["phone"]), language=lang)
+            self._reply(user["phone"], self.store.user_by_id(user["id"]), CONFIRM[lang], localized=True)
+            return "language"
+        if (seen := script_language(body)) is not None and (user.get("language") or "").split("-")[0] != seen:
+            # Writing in Telugu/Kannada/Tamil/Hindi script switches replies to that language.
+            self.store.update_user(user["id"], language=seen)
+            event("sms.language", phone=mask(user["phone"]), language=seen, detected=True)
+            user = self.store.user_by_id(user["id"])
         question = user.get("pending_question")
         if question == "publish" and user.get("pending_text"):
             handled = self._resolve_publish(user, body, sid)
+            if handled is not None:
+                return handled
+            user = self.store.user_by_id(user["id"])
+        elif question == "style" and user.get("pending_text"):
+            return self._resolve_style(user, body, sid)
+        elif question == "what" and user.get("pending_text"):
+            # Answer to "What's the website for?": "fitness" becomes "fitness website".
+            self.store.update_user(user["id"], pending_text=None, pending_question=None)
+            if self._command(user, word, rest, sid) is None and classify(
+                    body, has_projects=False, has_active=False).kind not in NEVER_BUILDS:
+                idea = body if target_kind(body) else f"{body} {user['pending_text']}"
+                if len(idea) >= MIN_PROMPT:
+                    return self._start_new(user, idea, sid, kind=target_kind(idea))
+            else:
+                return "handled"
+            user = self.store.user_by_id(user["id"])
+        elif question == "delete" and user.get("pending_text"):
+            handled = self._resolve_delete(user, body)
             if handled is not None:
                 return handled
             user = self.store.user_by_id(user["id"])
@@ -208,6 +469,13 @@ class SmsService:
             if user.get("pending_text"):
                 self.store.update_user(user["id"], pending_text=None)
             return command
+        if self.brain is not None and self._clear_new(user, body):
+            # "a website for my bakery", "fitness website": nothing for the AI to work out, so start (or ask the
+            # style question) right away instead of waiting seconds for a chat decision.
+            if user.get("pending_text"):
+                self.store.update_user(user["id"], pending_text=None)
+            event("sms.instant_new", phone=mask(user["phone"]))
+            return self._start_new(user, body, sid, kind="website")
         if self.brain is not None and classify(body, has_projects=True, has_active=True).kind in INSTANT:
             # Greetings, status, lists, links and cancel are answered by the rules right away: they never wait
             # for the AI (which can take minutes when Gemini is overloaded).
@@ -219,7 +487,7 @@ class SmsService:
             if user.get("pending_text"):
                 self.store.update_user(user["id"], pending_text=None)
             to, heard = getattr(self._req, "to", None), getattr(self._req, "heard", None)
-            self.brain.submit(lambda: self._think(user["id"], body, sid, to, heard))
+            self.brain.submit(lambda: self._think(user["id"], body, sid, to, heard), key=user["id"])
             return "thinking"
         if user.get("pending_text"):
             resolved = self._resolve_pending(user, body, sid)
@@ -227,6 +495,19 @@ class SmsService:
                 return resolved
             user = self.store.user_by_id(user["id"])
         return self._plain(user, body, sid)
+
+    def _clear_new(self, user: dict, body: str) -> bool:
+        """A request to build something new that the rules understand completely: it names a target (app or
+        website), has some substance, and can't be a change to an existing project."""
+        # Websites only: they wait on the style question next anyway, while an app request benefits from the AI
+        # turning a short idea into a fuller spec.
+        if target_kind(body) != "website" or substance(body) < 1 or len(body) < MIN_PROMPT:
+            return False
+        if not (NEW_SITE.search(body) or short_site_request(body)):
+            return False  # only explicit requests; anything chattier still goes to the AI
+        projects = self.store.projects(user["id"], limit=1)
+        intent = classify(body, has_projects=bool(projects), has_active=self._active_project(user) is not None)
+        return intent.kind == "new"
 
     # ---------- chat brain ----------
     def _think(self, user_id: int, body: str, sid: str, to: str | None, heard: str | None) -> str:
@@ -249,7 +530,13 @@ class SmsService:
 
     def _chat_context(self, user: dict, body: str) -> str:
         problem = self.website_problem()
-        lines = [f"Channel: {user['channel']}",
+        name = self._call_sign(user)
+        account = self.store.account_for_user(user["id"]) if user.get("account_id") else None
+        lines = [f"Their name: {name or 'unknown (they have not told you)'}"
+                 + (f" (Weave username {account['username']}, address {account['username']}.{self.s.sites_domain})"
+                    if account and self.s.sites_domain else ""),
+                 f"Reply language: {language_label(user.get('language'))}",
+                 f"Channel: {user['channel']}",
                  "Website builder: " + ("available" if not problem else f"NOT available ({problem})"),
                  "Publishing websites: " + ("available (owner must confirm)" if not self.publish_problem() and
                                             user["role"] == "owner" else "not available"),
@@ -302,6 +589,8 @@ class SmsService:
                 kind = None if self.websites_available() else said
             return self._start_new(user, spec, sid, lead=reply if kind else "", kind=kind)
         if d.action == "change_app":
+            if d.project is not None and project is None:
+                return self._clarify(user, "I couldn't find that project.")
             project = project or self._active_project(user)
             if project is None:
                 return self._clarify(user, reply or "Which app should I change?")
@@ -320,7 +609,10 @@ class SmsService:
             return self._retry(user, sid)
         if d.action == "publish":
             return self._publish_request(user, project)  # only asks; the owner must reply PUBLISH
-        self._reply(user["phone"], user, reply or "Sorry, I didn't catch that. What would you like to build?")
+        if reply:
+            self._reply(user["phone"], user, reply, localized=True)
+        else:
+            self._reply(user["phone"], user, "Sorry, I didn't catch that. What would you like to build?")
         return "chat"
 
     def _command(self, user: dict, word: str, rest: str, sid: str) -> str | None:
@@ -340,6 +632,8 @@ class SmsService:
                 return "awaiting_new"
             return None
         if word == "CHANGE" and rest:
+            if re.fullmatch(r"(?:app|project|site|website)\s*#?\d+", rest.strip(), re.I):
+                return self._clarify(user, "Which change should I make? To pick a project, say \"switch to <number>\".")
             project = self._active_project(user)
             if project is None:
                 return self._clarify(user, "Which app should I change?")
@@ -352,7 +646,15 @@ class SmsService:
             return self._use(user, number)
         if word in ("OPEN", "DOWNLOAD") and (not rest or number.isdigit()):
             return self._open(user, number)
-        if word == "LINK" and rest and " " not in rest.strip():
+        if word in ("INVITE", "REFER", "REFERRAL", "CODE") and not rest:
+            return self._invite(user)
+        if user["role"] == "owner" and word in ("TAKEDOWN", "REINSTATE", "REPORTS"):
+            return self._moderate(user, word, rest.strip().lower())
+        if word in ("DELETE", "REMOVE") and number.isdigit():
+            return self._delete_request(user, self.store.project_by_number(user["id"], int(number)))
+        if word == "CALL" and rest.lower().startswith("me ") and len(rest) <= 40:
+            return self._rename_me(user, rest[3:])
+        if word in ("LINK", "JOIN") and rest and " " not in rest.strip():
             self._reply(user["phone"], user, "This number is already linked. Just tell me what to build.")
             return "already_linked"
         if word in ("ABORT", "CANCEL") and not rest:  # bare CANCEL on SMS is an opt-out keyword and never gets here
@@ -378,23 +680,23 @@ class SmsService:
             return self._start_change(user, project, body, sid)
         kind = intent.kind
         if kind == "greeting":
+            hey = f"Hey {name}!" if (name := self._call_sign(user)) else "Hey!"
             if project is not None:
-                text = (f"Hey! We're working on {M.name_of(project)}. Tell me what to change "
+                text = (f"{hey} We're working on {M.name_of(project)}. Tell me what to change "
                         "(like \"make the buttons bigger\"), or describe a new app.")
             elif self.websites_available():
-                text = ("Hey! I'm Weave. Describe an Android app or a website and I'll build it, like \"a habit "
+                text = (f"{hey} I'm Weave. Describe an Android app or a website and I'll build it, like \"a habit "
                         "tracker with streaks\" or \"a website for my bakery\". You can also send a voice note.")
             else:
-                text = ("Hey! I'm Weave. Describe an app and I'll build it for your Android phone, "
+                text = (f"{hey} I'm Weave. Describe an app and I'll build it for your Android phone, "
                         "like \"a habit tracker with streaks and a dark theme\". You can also send a voice note.")
-            text = self._present("greeting", {"project": M.name_of(project) if project else None}, text, user_query=body)
+            # Fixed text, no AI rewording: a "hi" must be answered in seconds even when Gemini is overloaded.
             self._reply(user["phone"], user, text)
             return "greeting"
         if kind == "thanks":
             job = self.store.active_job(user["id"])
             text = ("I'll message you as soon as it's ready." if job else
                     "Anytime! Tell me a change or a new app idea whenever you like.")
-            text = self._present("thanks", {"has_job": bool(job)}, text, user_query=body)
             self._reply(user["phone"], user, text)
             return "thanks"
         if kind == "help":
@@ -423,6 +725,17 @@ class SmsService:
                 return "awaiting_new"
             return self._start_new(user, intent.arg, sid)
         if kind == "question":
+            # Only reached when the AI couldn't answer (or isn't on): answer what the rules can, honestly.
+            if re.search(r"\b(?:my name|who am i|what(?:'?s| is) my)\b", body, re.I):
+                name = self._call_sign(user)
+                self._reply(user["phone"], user, f"You're {name}! Want me to call you something else? Say \"call me ...\"."
+                            if name else "I don't know your name yet. Tell me: say \"call me ...\".")
+                return "question"
+            if not re.search(r"\b(?:you|u|weave)\b.*\b(?:do|make|build|create|work)\b|\b(?:can|could)\s+(?:you|u)\b",
+                             body, re.I):
+                self._reply(user["phone"], user, "Sorry, I'm a bit slow to think right now. Could you ask me that again "
+                                                 "in a moment?")
+                return "question_later"
             if self.websites_available():
                 fallback = ("I build Android apps and simple websites from a description (not iPhone "
                             "apps). Tell me what you'd like and I'll build it.")
@@ -441,6 +754,12 @@ class SmsService:
             return "ask_new_or_change"
         if kind in ("ambiguous", "change"):
             return self._clarify(user, "Which app is that for?")
+        if target_kind(body) == "website" and not re.sub(r"\b(?:a|an|the|my|new|make|build|create|me|website|site|"
+                                                          r"web ?page|please|pls)\b|[^\w]", "", body.lower()):
+            self.store.update_user(user["id"], awaiting_new=1, pending_text="website", pending_question="what")
+            self._reply(user["phone"], user, "Sure! What's the website for? Like \"my bakery called Crumbs\" or "
+                                             "\"my fitness coaching\".")
+            return "ask_what"
         if not projects:
             self._reply(user["phone"], user, "Tell me what app you'd like, e.g. \"a workout log that tracks my sets "
                                              "and shows weekly progress\".")
@@ -476,7 +795,8 @@ class SmsService:
         self._reply(user["phone"], user, "\n".join(lines))
         return "clarify"
 
-    def _start_new(self, user: dict, idea: str, sid: str, lead: str = "", kind: str | None = None) -> str:
+    def _start_new(self, user: dict, idea: str, sid: str, lead: str = "", kind: str | None = None,
+                   styled: bool = False) -> str:
         if len(idea) < MIN_PROMPT:
             self._reply(user["phone"], user, "Tell me a bit more about the app (at least 10 characters).")
             return "too_short"
@@ -497,8 +817,16 @@ class SmsService:
             self._reply(user["phone"], user, "Sorry, I can't make websites right now. "
                                              "I can make it as an Android app instead: say \"build it as an app\".")
             return "website_unavailable"
+        if kind == "website" and self.s.website_ask_style and not styled and not STYLE_WORDS.search(idea):
+            self.store.update_user(user["id"], pending_text=idea, pending_question="style")
+            self._reply(user["phone"], user, STYLE_QUESTION)
+            return "ask_style"
         if (blocked := self._gate(user)) is not None:
             return blocked
+        if user["role"] != "owner" and len(self.store.projects(user["id"], limit=self.s.max_projects)) >= self.s.max_projects:
+            self._reply(user["phone"], user, f"You have {self.s.max_projects} projects, the most an account can keep. "
+                        "Delete one first: text PROJECTS to see them, then DELETE <number>.")
+            return "project_limit"
         project = self.store.create_project(user["id"], idea, kind)
         job = self.store.enqueue_job(user_id=user["id"], project_id=project["id"], kind="new", prompt=idea,
                                      change_request=None, base_build_id=None,
@@ -515,6 +843,21 @@ class SmsService:
         text = self._present("build_accepted", facts, fallback, user_query=idea)
         self._reply(user["phone"], user, text, job_id=job["id"])
         return "queued_new"
+
+    def _resolve_style(self, user: dict, body: str, sid: str) -> str:
+        """Answer to the style question: a number, free-form preferences, "skip", or "cancel"."""
+        idea = user["pending_text"]
+        self.store.update_user(user["id"], pending_text=None, pending_question=None)
+        answer = body.strip()
+        if STYLE_STOP.fullmatch(answer):
+            self._reply(user["phone"], user, "Okay, I won't build that.")
+            return "pending_dropped"
+        if not answer or STYLE_SKIP.fullmatch(answer):
+            return self._start_new(user, idea, sid, kind="website", styled=True)
+        prefs = re.sub(r"(?<![\d.])([1-4])(?![\d.])", lambda m: STYLES[m.group(1)], answer, count=1)[:400]
+        event("sms.style_chosen", phone=mask(user["phone"]))
+        return self._start_new(user, f"{idea}\n\nDesign preferences from the customer: {prefs}", sid,
+                               kind="website", styled=True)
 
     def _resolve_kind(self, user: dict, body: str, sid: str) -> str | None:
         """Answer to "Android app or website?". None = they said something else (handled as a new message)."""
@@ -602,6 +945,10 @@ class SmsService:
             spec = (f"{change.strip()}\n\nBase it on my existing {'website' if current == 'website' else 'Android app'} "
                     f"\"{M.name_of(project)}\": {project['original_prompt'][:1500]}")
             return self._start_new(user, spec, sid, kind=other)
+        running = self.store.all("SELECT * FROM jobs WHERE user_id = ? AND status IN ('queued', 'running') ORDER BY id",
+                                 (user["id"],))
+        if running and all(j["project_id"] == project["id"] for j in running):
+            return self._queue_change(user, project, change, sid, running)
         if (blocked := self._gate(user)) is not None:
             return blocked
         changes = json.loads(project["changes"]) + [change[:1000]]
@@ -635,8 +982,35 @@ class SmsService:
         self._reply(user["phone"], user, text, job_id=job["id"])
         return "queued_change"
 
-    def _gate(self, user: dict) -> str | None:
-        active = self.store.active_job(user["id"])
+    def _queue_change(self, user: dict, project: dict, change: str, sid: str, running: list[dict]) -> str:
+        """A change for the project that is being built right now: queue it to run on top of that build instead of
+        telling the customer to come back later. Several such changes are applied together."""
+        if (blocked := self._gate(user, busy_ok=True)) is not None:
+            return blocked
+        spec = compose_spec(project["original_prompt"], json.loads(project["changes"]) + [change[:1000]])
+        if spec is None:
+            self._reply(user["phone"], user, "That project has too many changes to track by SMS. Text NEW <idea> to start fresh.")
+            return "too_long"
+        waiting = next((j for j in running if j["status"] == "queued" and j["kind"] == "change" and not j["base_build_id"]), None)
+        self.store.add_change(project["id"], change[:1000])
+        if waiting is not None:
+            self.store.update_job(waiting["id"], prompt=spec,
+                                  change_request=f"{waiting['change_request']}\nAlso: {change[:1000]}"[:3000])
+            self._reply(user["phone"], user, "Added that too. I'll apply all your changes together as soon as the "
+                                             "current build finishes.")
+            return "queued_change_merged"
+        current = running[0]
+        job = self.store.enqueue_job(user_id=user["id"], project_id=project["id"], kind="change", prompt=spec,
+                                     change_request=change[:1000], base_build_id=None,
+                                     max_attempts=self.s.sms_job_max_attempts, inbound_sid=sid)
+        event("sms.job_enqueued", ref=job["ref"], kind="change", deferred=True, phone=mask(user["phone"]))
+        self._reply(user["phone"], user, f"Got it. {M.name_of(project)} is still being built ({current['ref']}), so I'll "
+                                         "make that change right after it finishes and send you the updated link.",
+                    job_id=job["id"])
+        return "queued_change"
+
+    def _gate(self, user: dict, busy_ok: bool = False) -> str | None:
+        active = None if busy_ok else self.store.active_job(user["id"])
         if active:
             fallback = f"Build {active['ref']} is still in progress. Reply STATUS, or ABORT to stop it before starting another."
             facts = {"action": "gate_busy", "ref": active["ref"]}
@@ -644,6 +1018,7 @@ class SmsService:
             self._reply(user["phone"], user, text)
             return "busy"
         limit = self.s.sms_daily_builds_guest if user["role"] == "guest" else self.s.sms_daily_builds_member
+        limit += user.get("bonus_builds") or 0
         if self.store.jobs_since(user["id"], time.time() - 86_400) >= limit:
             event("sms.quota_exceeded", logging.WARNING, phone=mask(user["phone"]), limit=limit)
             fallback = f"You've reached the limit of {limit} builds per day. Please try again tomorrow."
@@ -909,7 +1284,8 @@ class SmsService:
         self.store.record_inbound(phone, "[voice note]", msg.sid, user["id"])
         self._reply(phone, user, f"Sorry, I couldn't use that voice note ({reason}). Could you type it instead?")
 
-    def _reply(self, phone: str, user: dict | None, text: str, job_id: int | None = None) -> None:
+    def _reply(self, phone: str, user: dict | None, text: str, job_id: int | None = None,
+               localized: bool = False) -> None:
         heard = getattr(self._req, "heard", None)
         if heard:
             self._req.heard = None  # only the first reply repeats what we heard
@@ -917,14 +1293,30 @@ class SmsService:
             text = f'You said: "{quoted}"\n\n{text}'
         to = address(user["phone"], user["channel"]) if user else phone
         sender = (user.get("reply_from") if user else None) or getattr(self._req, "to", None)
-        self._send(to, user["id"] if user else None, text, job_id, sender)
+        self._send(to, user["id"] if user else None, text, job_id, sender, localized=localized)
 
     def _send(self, phone: str, user_id: int | None, text: str, job_id: int | None = None,
-              sender: str | None = None) -> None:
+              sender: str | None = None, localized: bool = False) -> None:
         if sender is None and not phone.startswith("web:"):
             sender = getattr(self._req, "to", None)
         limit = M.MAX_CHARS if not phone.startswith(("whatsapp:", "web:")) else M.MAX_CHARS_CHAT
-        self.store.enqueue_sms(phone, M.fit(text, limit), user_id, job_id, sender)
+        self.queue_text(phone, user_id, text, limit, job_id, sender, localized)
+
+    def queue_text(self, phone: str, user_id: int | None, text: str, limit: int, job_id: int | None,
+                   sender: str | None, localized: bool = False) -> None:
+        """Every outgoing message passes here: in the person's language, translated in the background if needed."""
+        lang = (self.store.user_by_id(user_id) or {}).get("language") if user_id is not None else None
+        # Chat channels carry any script. Plain SMS is kept ASCII, unless the person reads another script.
+        unicode = phone.startswith(("whatsapp:", "web:")) or needs_translation(lang)
+
+        def fit(t: str) -> str:
+            return M.fit(t, limit, unicode=unicode)
+
+        if needs_translation(lang) and self.translator is not None and not localized:
+            msg_id = self.store.enqueue_sms(phone, fit(text), user_id, job_id, sender, status="localizing")
+            self.translator.submit(msg_id, user_id, text, lang, fit)
+            return
+        self.store.enqueue_sms(phone, fit(text), user_id, job_id, sender)
 
 
 def channel_of(sender: str | None) -> str:

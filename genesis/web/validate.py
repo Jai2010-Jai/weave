@@ -56,6 +56,39 @@ def validate_page(html: str) -> None:
         raise WebsiteValidationError("; ".join(sorted(set(scan.problems))[:5]))
 
 
+SENSITIVE_WORDS = {"password", "passwd", "passcode", "pwd", "pass", "card", "cardnumber", "cc", "ccnumber", "cvv", "cvc",
+                   "otp", "ssn", "aadhaar", "aadhar", "pan", "iban", "routing", "seed", "mnemonic", "cc-number",
+                   "cc-csc", "cc-exp", "one-time-code", "current-password", "new-password"}
+
+
+class _Fields(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.found: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "input":
+            return
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if a.get("type", "").lower() == "password":
+            self.found.append("password field")
+        elif a.get("autocomplete", "").lower() in SENSITIVE_WORDS or any(
+                w in SENSITIVE_WORDS for k in ("name", "id")
+                for w in re.split(r"[^a-z0-9]+", re.sub(r"([a-z])([A-Z])", r"\1_\2", a.get(k, "")).lower())):
+            self.found.append(f"{a.get('name') or a.get('id') or a.get('autocomplete')} field")
+
+
+def public_problem(site_dir: Path) -> str:
+    """Why a site can't go on a public address, or "". Pages that ask for passwords, card numbers or one-time codes
+    are the shape of phishing, so they stay on the private preview link only."""
+    for p in sorted(site_dir.glob("*.html")):
+        scan = _Fields()
+        scan.feed(p.read_text(encoding="utf-8", errors="replace"))
+        if scan.found:
+            return f"{p.name} asks for sensitive details ({scan.found[0]})"
+    return ""
+
+
 def validate_site(site_dir: Path) -> list[dict]:
     """Validate every file the bridge wrote. Returns [{file, bytes}]. Raises WebsiteValidationError."""
     files = sorted(p for p in site_dir.iterdir()) if site_dir.is_dir() else []

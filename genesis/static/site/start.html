@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Weave · Get started</title>
+<link rel="stylesheet" href="/site/site.css">
+<script src="/site/site.js" defer></script>
+<script src="/site/start.js" defer></script>
+</head>
+<body>
+<header class="bar"><a class="brand" href="/start">Weave</a><a href="/dashboard">Dashboard</a></header>
+<main class="wrap narrow">
+  <h1>Build apps and websites by text.</h1>
+  <p class="lead">Message Weave on WhatsApp, describe what you want, and get a live link in minutes.</p>
+
+  <div class="tabs" id="tabs">
+    <button type="button" class="on" data-tab="signup">Create account</button>
+    <button type="button" data-tab="login">Sign in</button>
+  </div>
+
+  <section class="card" id="signup">
+    <div id="google-box" hidden>
+      <a class="btn ghost wide" id="google-btn" href="/auth/google">Continue with Google</a>
+      <div class="or">or with email</div>
+    </div>
+    <p class="notice" id="google-pending" hidden></p>
+    <form id="signup-form" novalidate>
+      <label for="username">Username (your address, can't be changed later)</label>
+      <div class="addr"><input id="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false"
+        maxlength="20" placeholder="yourname" required><span id="domain">.askweave.xyz</span></div>
+      <div class="hint" id="username-hint">3–20 lowercase letters, numbers or hyphens.</div>
+
+      <label for="call-sign">What should Weave call you?</label>
+      <input id="call-sign" type="text" maxlength="30" placeholder="e.g. Sam" required>
+
+      <div id="email-fields">
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="email" required>
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="new-password" minlength="8" required>
+      </div>
+
+      <label for="invite">Invite code (optional)</label>
+      <input id="invite" type="text" maxlength="16" autocapitalize="characters" spellcheck="false">
+
+      <label class="check"><input id="terms" type="checkbox"> <span>I agree to the <a href="/terms" target="_blank">Terms</a>
+        and <a href="/privacy" target="_blank">Privacy Policy</a>, and I won't use Weave for scams, phishing or anything illegal.</span></label>
+      <button class="btn wide" type="submit" id="signup-btn">Create account</button>
+      <div class="error" id="signup-error" role="alert"></div>
+    </form>
+  </section>
+
+  <section class="card" id="login" hidden>
+    <a class="btn ghost wide" id="google-login" href="/auth/google" hidden>Sign in with Google</a>
+    <div class="or" id="login-or" hidden>or</div>
+    <form id="login-form" novalidate>
+      <label for="login-email">Email</label>
+      <input id="login-email" type="email" autocomplete="email" required>
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" autocomplete="current-password" required>
+      <button class="btn wide" type="submit">Sign in</button>
+      <div class="error" id="login-error" role="alert"></div>
+    </form>
+  </section>
+
+  <h2>How it works</h2>
+  <ol class="muted">
+    <li>Create your account and pick your address.</li>
+    <li>Tap <b>Message Weave</b> to connect your WhatsApp number.</li>
+    <li>Text an idea like "a website for my bakery". Your site goes live at <span class="mono">you.askweave.xyz/bakery</span>.</li>
+  </ol>
+</main>
+<footer class="site"><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/report">Report abuse</a></footer>
+</body>
+</html>

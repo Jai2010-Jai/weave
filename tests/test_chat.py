@@ -47,7 +47,7 @@ def test_page_and_assets_are_public_with_strict_csp(env):
     assert c.get("/chat/../server.py").status_code in (401, 404)
     assert c.get("/chat/secret.txt").status_code == 404
     assert c.get("/api/chat/state").status_code == 401
-    assert c.get("/", headers=TUNNEL).status_code == 401  # the dashboard is still private
+    assert c.get("/", headers=TUNNEL, follow_redirects=False).headers.get("location") == "/start"  # dashboard stays private
 
 
 def test_sign_in_rules(env):

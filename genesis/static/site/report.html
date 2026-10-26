@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Weave · Report abuse</title>
+<link rel="stylesheet" href="/site/site.css">
+<script src="/site/site.js" defer></script>
+<script src="/site/report.js" defer></script>
+</head>
+<body>
+<header class="bar"><a class="brand" href="/start">Weave</a></header>
+<main class="wrap narrow">
+  <h1>Report a site</h1>
+  <p class="lead">Seen a Weave site used for phishing, scams or anything harmful? Tell us and we'll review it quickly.</p>
+  <section class="card">
+    <form id="report-form" novalidate>
+      <label for="site">Site address</label>
+      <input id="site" type="text" placeholder="https://name.askweave.xyz/page/" required>
+      <label for="reason">What's wrong?</label>
+      <select id="reason">
+        <option value="phishing">Phishing / steals passwords or card details</option>
+        <option value="scam">Scam or fraud</option>
+        <option value="impersonation">Pretends to be a company or person</option>
+        <option value="malware">Malware or harmful downloads</option>
+        <option value="adult">Sexual content</option>
+        <option value="hate">Hate or harassment</option>
+        <option value="copyright">Copyright</option>
+        <option value="other">Something else</option>
+      </select>
+      <label for="details">Details (optional)</label>
+      <textarea id="details" maxlength="2000"></textarea>
+      <button class="btn wide" type="submit">Send report</button>
+      <div class="error" id="report-error" role="alert"></div>
+    </form>
+    <p class="notice" id="report-done" hidden>Thanks. We've received your report and will look at it.</p>
+  </section>
+</main>
+<footer class="site"><a href="/terms">Terms</a><a href="/privacy">Privacy</a></footer>
+</body>
+</html>

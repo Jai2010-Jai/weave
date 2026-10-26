@@ -168,8 +168,9 @@ def test_public_and_private_endpoint_authorization(test_app_and_client):
     assert res_local.status_code == 200
 
     # 2. External request via tunnel (carrying proxy headers): private endpoints rejected with 401
-    res_proxy_private = client.get("/", headers={"x-forwarded-for": "203.0.113.195", "cf-connecting-ip": "203.0.113.195"})
-    assert res_proxy_private.status_code == 401
+    res_proxy_private = client.get("/", headers={"x-forwarded-for": "203.0.113.195", "cf-connecting-ip": "203.0.113.195"},
+                                   follow_redirects=False)
+    assert res_proxy_private.status_code == 303 and res_proxy_private.headers["location"] == "/start"
 
     res_proxy_builds = client.get("/api/builds", headers={"x-forwarded-for": "203.0.113.195"})
     assert res_proxy_builds.status_code == 401

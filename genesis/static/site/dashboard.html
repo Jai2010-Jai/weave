@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Weave · Dashboard</title>
+<link rel="stylesheet" href="/site/site.css">
+<script src="/site/site.js" defer></script>
+<script src="/site/dashboard.js" defer></script>
+</head>
+<body>
+<header class="bar"><a class="brand" href="/dashboard">Weave</a><span class="muted small" id="who"></span>
+  <button class="btn ghost small" type="button" id="logout">Sign out</button></header>
+<main class="wrap" id="main" hidden>
+  <h1 id="hello">Hi</h1>
+  <p class="lead">Your address: <a id="address" class="mono" target="_blank" rel="noopener"></a></p>
+
+  <section class="card" id="connect" hidden>
+    <h3>Connect your WhatsApp</h3>
+    <p class="muted" id="connect-text">Tap the button and send the message that opens. That proves the number is yours.</p>
+    <div id="code-box" hidden>
+      <div class="code" id="code"></div>
+      <p class="small muted">Send <code id="code-msg"></code> to Weave on WhatsApp within an hour.</p>
+    </div>
+    <div class="row">
+      <a class="btn green" id="wa" target="_blank" rel="noopener" hidden>Message Weave</a>
+      <button class="btn ghost" type="button" id="get-code">Get my code</button>
+      <button class="btn ghost small" type="button" id="recheck" hidden>I sent it</button>
+    </div>
+  </section>
+
+  <section class="card" id="linked" hidden>
+    <div class="row"><span>WhatsApp: <b id="phone"></b></span>
+      <a class="btn green small" id="wa-open" target="_blank" rel="noopener">Message Weave</a>
+      <button class="btn ghost small" type="button" id="change-number">Change number</button></div>
+  </section>
+
+  <h2>Your projects</h2>
+  <section class="card">
+    <form id="new-form" class="row" novalidate>
+      <input id="idea" type="text" maxlength="1500" placeholder="Describe something new, e.g. a website for my bakery">
+      <button class="btn" type="submit">Build it</button>
+    </form>
+    <div class="hint" id="new-hint">Weave replies on WhatsApp with questions and the link when it's ready.</div>
+  </section>
+  <section class="card"><ul class="projects" id="projects"></ul></section>
+
+  <div id="trash-box" hidden>
+    <h2>Recently deleted</h2>
+    <p class="small muted" id="trash-note"></p>
+    <section class="card"><ul class="projects" id="trash"></ul></section>
+  </div>
+
+  <h2>Usage</h2>
+  <div class="stats" id="stats"></div>
+
+  <h2>Settings</h2>
+  <section class="card">
+    <label for="call-sign">What Weave calls you</label>
+    <form id="call-form" class="row" novalidate><input id="call-sign" type="text" maxlength="30">
+      <button class="btn ghost" type="submit">Save</button></form>
+    <div class="hint" id="call-hint"></div>
+    <p class="small muted" id="invite-line" hidden>Invite friends with code <code id="invite"></code>. They enter it when they sign up.</p>
+  </section>
+  <section class="card">
+    <h3>Your data</h3>
+    <div class="row"><a class="btn ghost small" href="/api/account/export">Download my data</a>
+      <button class="btn danger small" type="button" id="delete-account">Delete account</button></div>
+  </section>
+</main>
+<footer class="site"><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/report">Report abuse</a></footer>
+</body>
+</html>

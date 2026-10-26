@@ -95,7 +95,8 @@ def code_of(settings):
 def test_remote_requires_access_code(client):
     rc = remote_client(client)
     assert rc.get("/api/builds").status_code == 401
-    assert rc.get("/").status_code == 401
+    front = rc.get("/", follow_redirects=False)  # the public front door is the sign-up page, not the dashboard
+    assert front.status_code == 303 and front.headers["location"] == "/start"
     assert rc.get("/api/builds", headers={"Authorization": "Bearer WRONG-CODE-1234-5678"}).status_code == 401
 
 

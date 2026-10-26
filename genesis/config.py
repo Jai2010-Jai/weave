@@ -185,7 +185,18 @@ class Settings:
     # Externally visible https origin that Twilio calls (used for signature validation and download links).
     public_base_url: str = field(default_factory=lambda: _str_env("PUBLIC_BASE_URL").rstrip("/"))
     # closed: only GENESIS_SMS_OWNER_NUMBERS; link: others must text LINK <one-time code>; open: anyone gets an isolated guest account.
-    sms_signup: str = field(default_factory=lambda: _choice_env("GENESIS_SMS_SIGNUP", "link", {"closed", "link", "open"}))
+    # account: numbers must belong to an askweave.xyz account (sign up on the site, then text LINK <code>).
+    sms_signup: str = field(default_factory=lambda: _choice_env("GENESIS_SMS_SIGNUP", "link", {"closed", "link", "open", "account"}))
+    # Referrals: users text INVITE for a code; friends text JOIN <code> to get a guest account (works in link mode too).
+    sms_referrals: bool = field(default_factory=lambda: _choice_env("GENESIS_SMS_REFERRALS", "on", {"on", "off"}) == "on")
+    sms_referral_bonus: int = field(default_factory=lambda: _int_env("GENESIS_SMS_REFERRAL_BONUS", 2, 0, 50))
+    sms_referral_max: int = field(default_factory=lambda: _int_env("GENESIS_SMS_REFERRAL_MAX", 20, 0, 1000))
+    # Accounts (askweave.xyz sign-up). Google sign-in shows only when both are set.
+    google_client_id: str = field(default_factory=lambda: _str_env("GOOGLE_CLIENT_ID"))
+    google_client_secret: str = field(default_factory=lambda: _str_env("GOOGLE_CLIENT_SECRET"), repr=False)
+    user_storage_mb: int = field(default_factory=lambda: _int_env("GENESIS_USER_STORAGE_MB", 50, 1, 10_000))
+    max_projects: int = field(default_factory=lambda: _int_env("GENESIS_MAX_PROJECTS", 25, 1, 1000))
+    trash_days: int = field(default_factory=lambda: _int_env("GENESIS_TRASH_DAYS", 30, 1, 365))
     sms_owner_numbers: list[str] = field(default_factory=lambda: _list_env("GENESIS_SMS_OWNER_NUMBERS"))
     sms_default_country_code: str = field(default_factory=lambda: _str_env("GENESIS_SMS_DEFAULT_COUNTRY_CODE", "+1"))
     sms_worker: str = field(default_factory=lambda: _choice_env("GENESIS_SMS_WORKER", "embedded", {"embedded", "external"}))
@@ -202,6 +213,12 @@ class Settings:
     chat_timeout: int = field(default_factory=lambda: _int_env("GENESIS_CHAT_TIMEOUT_SECONDS", 25, 5, 600))
     # Model for chat replies only (Gemini API backend). A light model answers in ~2 s; empty = GEMINI_MODEL.
     chat_model: str = field(default_factory=lambda: _str_env("GENESIS_CHAT_MODEL", "gemini-3.5-flash-lite"))
+    # A chat reply that hasn't arrived after chat_hedge_seconds is also asked of this model; the first answer wins.
+    # Replies took 2-14 s on the lite model alone (and longer when it was busy).
+    chat_fallback_model: str = field(default_factory=lambda: _str_env("GENESIS_CHAT_FALLBACK_MODEL", "gemini-2.5-flash"))
+    chat_hedge_seconds: float = field(default_factory=lambda: float(_int_env("GENESIS_CHAT_HEDGE_SECONDS", 4, 1, 60)))
+    # Chat replies for different people are worked out at the same time (each person's messages stay in order).
+    chat_workers: int = field(default_factory=lambda: _int_env("GENESIS_CHAT_WORKERS", 16, 1, 64))
     # Natural Language Generation (NLG): rephrases factual results conversationally. off = deterministic only.
     nlg_enabled: bool = field(default_factory=lambda: _choice_env("GENESIS_NLG", "on", {"on", "off"}) == "on")
     nlg_timeout: int = field(default_factory=lambda: _int_env("GENESIS_NLG_TIMEOUT_SECONDS", 12, 2, 60))
@@ -219,9 +236,18 @@ class Settings:
     node_bin: str = field(default_factory=lambda: _str_env("GENESIS_NODE_BIN") or shutil.which("node") or "")
     # Design options generated per new website (each is one more large Gemini call).
     website_variants: int = field(default_factory=lambda: _int_env("GENESIS_WEBSITE_VARIANTS", 1, 1, 3))
-    # Tried in order when the main model is overloaded (Gemini 503/429); each model family has its own capacity.
+    # Tried in order when the main model is overloaded (Gemini 503/429) or stalls; each model family has its own
+    # capacity. Ordered by measured speed on real builds: 2.5-flash without thinking ~120 tokens/s, while
+    # 3.8-flash managed 28-69 tokens/s and once took 6 minutes for one page, so it goes last.
     website_fallback_models: str = field(default_factory=lambda: _str_env("GENESIS_WEBSITE_FALLBACK_MODELS") or
-                                         "gemini-3.8-flash,gemini-2.5-flash,gemini-flash-latest,gemini-3.5-flash-lite")
+                                         "gemini-2.5-flash,gemini-flash-latest,gemini-3.5-flash-lite,gemini-3.8-flash")
+    # Ask the user's style preferences (numbered choices, colours, or "skip") before designing a new website.
+    website_ask_style: bool = field(default_factory=lambda: _choice_env("GENESIS_WEBSITE_ASK_STYLE", "on", {"on", "off"}) == "on")
+    # Website builds mostly wait on Gemini, so several run at once; Android builds stay CPU-bound
+    # (GENESIS_MAX_CONCURRENT_BUILDS).
+    # How much Gemini "thinks" before writing a page: low (fast), minimal (fastest), or default (slowest).
+    website_thinking: str = field(default_factory=lambda: _choice_env("GENESIS_WEBSITE_THINKING", "low", {"low", "minimal", "default"}))
+    website_workers: int = field(default_factory=lambda: _int_env("GENESIS_WEBSITE_WORKERS", 4, 1, 16))
     # Extra pages (about, contact, ...) added to each new website; 0 = one-page sites. Each is one more Gemini call.
     website_pages: int = field(default_factory=lambda: _int_env("GENESIS_WEBSITE_PAGES", 3, 0, 4))
     website_timeout: int = field(default_factory=lambda: _int_env("GENESIS_WEBSITE_TIMEOUT_SECONDS", 1200, 60, 3600))
@@ -242,6 +268,16 @@ class Settings:
     @property
     def hosted_dir(self) -> Path:
         return self.data_dir / "hosted"
+
+    @property
+    def user_sites_dir(self) -> Path:
+        """Sites of account holders: <user_sites_dir>/<username>/<project slug>/."""
+        return self.data_dir / "hosted-users"
+
+    @property
+    def trash_dir(self) -> Path:
+        """Deleted projects, restorable until purged after GENESIS_TRASH_DAYS."""
+        return self.data_dir / "hosted-trash"
 
     @property
     def gradle_user_home(self) -> Path:
