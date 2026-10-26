@@ -30,7 +30,8 @@ class ReadySettings(Settings):
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     s = ReadySettings(data_dir=tmp_path / "data", template_dir=ROOT / "android_template",
-                      gemini_api_key="test-key-not-real", java_home=tmp_path, android_home=tmp_path)
+                      gemini_api_key="test-key-not-real", java_home=tmp_path, android_home=tmp_path,
+                      ai_provider="gemini")  # never the real GLM key from .env
     s.max_repairs = 2
     s.ai_backend = "api"
     # Never use real Twilio credentials from .env in tests: outbound SMS go to a fake provider.

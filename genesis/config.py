@@ -142,6 +142,14 @@ class Settings:
     data_dir: Path = ROOT / "data"
     gemini_api_key: str = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY", "").strip(), repr=False)
     gemini_model: str = field(default_factory=lambda: os.environ.get("GEMINI_MODEL", "auto").strip() or "auto")
+    # gemini = Google's Gemini API; glm = Zhipu / Z.ai GLM models (GLM_API_KEY) for chat, apps and websites alike.
+    ai_provider: str = field(default_factory=lambda: _choice_env("GENESIS_AI_PROVIDER", "gemini", {"gemini", "glm"}))
+    glm_api_key: str = field(default_factory=lambda: _str_env("GLM_API_KEY"), repr=False)
+    glm_base_url: str = field(default_factory=lambda: _str_env("GLM_BASE_URL") or "https://api.z.ai/api/paas/v4")
+    glm_model: str = field(default_factory=lambda: _str_env("GLM_MODEL") or "glm-4.7-flash")
+    # Asked when the main GLM model stays busy. Empty by default: only glm-4.7-flash is free (glm-4.5-flash answers
+    # "insufficient balance" without a paid plan), and busy answers are retried on the same model instead.
+    glm_fallback_models: str = field(default_factory=lambda: _str_env("GLM_FALLBACK_MODELS"))
     # api = Gemini API with GEMINI_API_KEY; antigravity = the Antigravity desktop app's agent (no API key).
     ai_backend: str = field(default_factory=lambda: _choice_env("GENESIS_AI_BACKEND", "api", {"api", "antigravity"}))
     antigravity_model: str = field(default_factory=lambda: _choice_env(
@@ -306,6 +314,15 @@ class Settings:
             return True
         return (self.sms_provider == "twilio" and bool(self.twilio_account_sid and self.twilio_auth_token)
                 and bool(self.twilio_phone_number or self.twilio_whatsapp_number or self.twilio_messaging_service_sid))
+
+    def __post_init__(self) -> None:
+        if self.ai_provider == "glm":
+            # Every AI call goes to GLM: the Gemini code paths stay, pointed at the GLM key and models.
+            fallbacks = [m.strip() for m in self.glm_fallback_models.split(",") if m.strip()]
+            self.gemini_api_key = self.glm_api_key
+            self.gemini_model = self.chat_model = self.nlg_model = self.glm_model
+            self.chat_fallback_model = fallbacks[0] if fallbacks else ""
+            self.website_fallback_models = ",".join(fallbacks)
 
     def sms_issues(self) -> list[str]:
         """Configuration problems that stop the messaging channels from working (names only, never values)."""

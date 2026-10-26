@@ -94,7 +94,7 @@ def test_bridge_env_holds_only_the_gemini_key(web_settings):
         assert secret not in joined
     assert set(env) == {"PATH", "HOME", "TMPDIR", "WEAVE_DATA_DIR", "AGY_BIN", "GEMINI_API_KEY", "GEMINI_MODEL",
                         "GEMINI_FALLBACK_MODELS", "NODE_OPTIONS", "WEBSITE_DEADLINE_MS",
-                        "GENESIS_WEBSITE_THINKING", "GEMINI_HEALTH_FILE"}
+                        "GENESIS_WEBSITE_THINKING", "GEMINI_HEALTH_FILE", "GENESIS_AI_PROVIDER", "GLM_BASE_URL"}
 
 
 def test_engine_failure_fails_the_build(web_settings):

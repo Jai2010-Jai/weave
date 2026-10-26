@@ -64,11 +64,11 @@ function readStdin() {
 // that to write a whole page (seen in practice: "fetch failed" at exactly 301 s). Gemini API requests go through
 // node:https instead, which has no such limit. Genesis's own timeout (GENESIS_WEBSITE_TIMEOUT_SECONDS) still
 // kills the whole bridge. Every other request keeps the normal fetch.
-const GEMINI_HOST = 'generativelanguage.googleapis.com';
+const AI_HOSTS = new Set(['generativelanguage.googleapis.com', 'api.z.ai', 'open.bigmodel.cn']);
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === 'string' ? input : input.url);
-  if (url.hostname !== GEMINI_HOST) return nativeFetch(input, init);
+  if (!AI_HOSTS.has(url.hostname)) return nativeFetch(input, init);
   const https = await import('node:https');
   return new Promise((resolve, reject) => {
     const req = https.request(url, { method: init.method || 'GET', headers: init.headers || {} }, (res) => {
@@ -182,6 +182,46 @@ const TRANSIENT = /\((?:429|500|502|503|504)\)|UNAVAILABLE|RESOURCE_EXHAUSTED|ov
 let phase = 'setup';
 const aiText = {}; // phase -> last raw model text
 
+// GENESIS_AI_PROVIDER=glm: the engine's Gemini calls go to GLM (Zhipu / Z.ai) instead, in the OpenAI chat format,
+// answering in the shape weave reads ({ text, raw.usageMetadata }). GLM's JSON mode takes no schema, so the schema is
+// spelled out in the system prompt. Busy answers (code 1305 "overloaded" and friends) report as (503) so the retry and
+// next-model logic above treats them like Gemini's.
+async function glmGenerate(model, apiKey, prompt, system, config = {}) {
+  const schema = config?.responseJsonSchema;
+  const sys = (system || '') + (schema
+    ? `\n\nReply with one JSON object only (no markdown fences) that matches this JSON schema:\n${JSON.stringify(schema)}` : '');
+  const body = {
+    model,
+    messages: [...(sys ? [{ role: 'system', content: sys }] : []), { role: 'user', content: prompt }],
+    max_tokens: Math.min(config?.maxOutputTokens || 32768, 32768),
+    thinking: { type: 'disabled' },
+  };
+  if (config?.temperature != null) body.temperature = config.temperature;
+  if (schema || config?.responseMimeType === 'application/json') body.response_format = { type: 'json_object' };
+  const base = (process.env.GLM_BASE_URL || 'https://api.z.ai/api/paas/v4').replace(/\/$/, '');
+  // The free glm-4.7-flash answers "overloaded" about half the time and fine a moment later: ask again first.
+  let res;
+  let raw;
+  for (const pause of [500, 1000, 2000, 3000, 5000, null]) {
+    res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(body),
+    });
+    raw = await res.text();
+    if (res.ok) break;
+    let code = '';
+    try { code = String(JSON.parse(raw)?.error?.code ?? ''); } catch { /* not JSON */ }
+    const busy = ['1302', '1303', '1305', '1312'].includes(code) || res.status >= 500;
+    if (!busy || pause === null) throw new Error(`GLM API error (${busy ? 503 : res.status}): ${code} ${raw.slice(0, 300)}`);
+    await new Promise((r) => setTimeout(r, pause));
+  }
+  const data = JSON.parse(raw);
+  const usage = data.usage || {};
+  return { text: data.choices?.[0]?.message?.content || '',
+    raw: { usageMetadata: { promptTokenCount: usage.prompt_tokens, candidatesTokenCount: usage.completion_tokens } } };
+}
+
 async function loadEngine(engineDir) {
   const src = path.join(engineDir, 'src');
   for (const f of ['gemini-client.js', 'portfolio/designInspirationResearcher.js', 'portfolio/bespokeHtmlGenerator.js']) {
@@ -195,7 +235,9 @@ async function loadEngine(engineDir) {
 
   geminiClient.generateViaAgy = async () => { throw new Error('agy CLI is disabled by Genesis'); };
   geminiClient.resolveCloudCodeProject = async () => { throw new Error('Cloud Code OAuth is disabled by Genesis'); };
-  const original = geminiClient.generateContent.bind(geminiClient);
+  const original = process.env.GENESIS_AI_PROVIDER === 'glm'
+    ? (prompt, system, config) => glmGenerate(geminiClient.model, geminiClient.apiKey, prompt, system, config)
+    : geminiClient.generateContent.bind(geminiClient);
   geminiClient.generateContent = async (prompt, system, config) => {
     if (!geminiClient.apiKey) {
       const err = new Error('GEMINI_API_KEY is not set for the website engine');

@@ -6,6 +6,7 @@ import json
 import logging
 import threading
 import time
+from types import SimpleNamespace
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from pydantic import BaseModel, ValidationError as PydanticValidationError
@@ -66,6 +67,11 @@ class GeminiClient:
     def _get_client(self):
         if not self.configured:
             raise GeminiError("GEMINI_API_KEY is not set. Add it to .env (see README) and restart Genesis.")
+        if self._client is None and self.s.ai_provider == "glm":
+            from .glm import GlmModels
+
+            models = [self.s.glm_model] + [m for m in self.s.website_fallback_models.split(",") if m]
+            self._client = SimpleNamespace(models=GlmModels(self.s.gemini_api_key, self.s.glm_base_url, models))
         if self._client is None:
             from google import genai  # imported lazily so tests run without network
 
@@ -230,6 +236,8 @@ class GeminiClient:
             except GeminiError:
                 available = set()
             candidates += [m for m in PREFERRED_MODELS if m != model and m in available][:2]
+        elif self.s.ai_provider == "glm":
+            candidates += [m for m in self.s.website_fallback_models.split(",") if m and m != model]
         candidates = self.health.order(candidates)
         last: Exception | None = None
         # Fast bounded backoff for interactive requests:

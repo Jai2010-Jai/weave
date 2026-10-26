@@ -194,6 +194,7 @@ class WebsiteBuilder:
                 "WEAVE_DATA_DIR": str(sandbox / "weave"), "AGY_BIN": "/nonexistent/agy",
                 "GEMINI_API_KEY": self.s.gemini_api_key, "GEMINI_MODEL": self._model(),
                 "GEMINI_FALLBACK_MODELS": self.s.website_fallback_models, "NODE_OPTIONS": "",
+                "GENESIS_AI_PROVIDER": self.s.ai_provider, "GLM_BASE_URL": self.s.glm_base_url,
                 "GENESIS_WEBSITE_THINKING": self.s.website_thinking,
                 # Shared by every build: models overloaded in the last minutes are tried last.
                 "GEMINI_HEALTH_FILE": str(self.s.data_dir / "gemini-health.json"),
